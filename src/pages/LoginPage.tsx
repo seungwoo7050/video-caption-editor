@@ -4,6 +4,7 @@ import { apiGet } from '@/lib/apiClient';
 import type { ApiError } from '@/lib/apiError';
 
 export default function LoginPage() {
+  // throw new Error('FE-09 crash test');
   const [last, setLast] = useState<string>('(no call yet)');
 
   const callHealthOk = async () => {
