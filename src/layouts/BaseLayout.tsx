@@ -1,5 +1,7 @@
 import { NavLink, Outlet } from "react-router-dom";
 
+import { IndexedDbSmoke } from "@/components/IndexedDbSmoke";
+
 function ToastPlaceholder() {
   return (
     <div
@@ -65,6 +67,7 @@ export default function BaseLayout() {
       </div>
 
       <ToastPlaceholder />
+      <IndexedDbSmoke />
     </div>
   );
 }

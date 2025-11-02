@@ -1,5 +1,6 @@
-import type { Caption, CreateVideoInput, DataSource, Video, VideoId } from './types'
 import { seededVideos } from './fixtures'
+
+import type { Caption, CreateVideoInput, DataSource, Video, VideoId } from './types'
 
 export function createMockDataSource(): DataSource {
   const videosById = new Map<VideoId, Video>()
