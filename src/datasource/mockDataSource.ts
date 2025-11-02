@@ -1,27 +1,35 @@
 import type { Caption, CreateVideoInput, DataSource, Video, VideoId } from './types'
+import { seededVideos } from './fixtures'
 
 export function createMockDataSource(): DataSource {
+  const videosById = new Map<VideoId, Video>()
+  for (const v of seededVideos) videosById.set(v.id, v)
+
+  let seq = 1
+  const nextId = () => `v_mock_${String(seq++).padStart(4, '0')}`
+
   return {
     async listVideos(): Promise<Video[]> {
-      return []
+      return Array.from(videosById.values()).sort((a, b) => b.createdAt - a.createdAt)
     },
 
-    async getVideo(_id: VideoId): Promise<Video | null> {
-      void _id
-      return null
+    async getVideo(id: VideoId): Promise<Video | null> {
+      return videosById.get(id) ?? null
     },
 
     async createVideo(input: CreateVideoInput): Promise<Video> {
       const now = Date.now()
-      return {
-        id: `mock_${now}`,
+      const v: Video = {
+        id: nextId(),
         title: input.title,
         createdAt: now,
       }
+      videosById.set(v.id, v)
+      return v
     },
 
-    async deleteVideo(_id: VideoId): Promise<void> {
-      void _id
+    async deleteVideo(id: VideoId): Promise<void> {
+      videosById.delete(id)
     },
 
     async listCaptions(_videoId: VideoId): Promise<Caption[]> {
