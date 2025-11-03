@@ -51,6 +51,15 @@ export default function BaseLayout() {
             Login
           </NavLink>
           <NavLink
+            to="/upload"
+            style={({ isActive }) => ({
+              textDecoration: "none",
+              fontWeight: isActive ? 700 : 400,
+            })}
+          >
+            Upload
+          </NavLink>
+          <NavLink
             to="/videos"
             style={({ isActive }) => ({
               textDecoration: "none",

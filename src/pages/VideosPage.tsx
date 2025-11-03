@@ -40,6 +40,20 @@ export default function VideosPage() {
         <span style={{ color: '#666' }}>
           {isPending ? '로딩 중…' : `${videos?.length ?? 0}개`}
         </span>
+        <div style={{ flex: 1 }} />
+        <Link
+          to="/upload"
+          style={{
+            padding: '8px 12px',
+            borderRadius: 8,
+            border: '1px solid #111',
+            textDecoration: 'none',
+            color: '#111',
+            fontWeight: 600,
+          }}
+        >
+          새 비디오 업로드
+        </Link>
       </div>
 
       <div style={{ marginTop: 16 }}>
