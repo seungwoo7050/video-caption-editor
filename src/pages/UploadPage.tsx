@@ -1,5 +1,10 @@
 import { useMemo, useState } from 'react';
-import { Link } from 'react-router-dom';
+import { Link, useNavigate } from 'react-router-dom';
+
+
+import { dataSource } from '@/datasource';
+import type { Video } from '@/datasource/types';
+import { queryClient } from '@/lib/queryClient';
 
 import type { FormEvent } from 'react';
 
@@ -43,6 +48,13 @@ function getErrors(input: { title: string; videoFile: File | null; thumbnailFile
   };
 }
 
+function generateVideoId() {
+  if (typeof crypto !== 'undefined' && 'randomUUID' in crypto && typeof crypto.randomUUID === 'function') {
+    return crypto.randomUUID();
+  }
+  return `v_${Date.now()}_${Math.random().toString(16).slice(2)}`;
+}
+
 export default function UploadPage() {
   const [title, setTitle] = useState('');
   const [videoFile, setVideoFile] = useState<File | null>(null);
@@ -50,6 +62,8 @@ export default function UploadPage() {
   const [errors, setErrors] = useState<FormErrors>({});
   const [status, setStatus] = useState<string>('');
   const [didSubmitOnce, setDidSubmitOnce] = useState(false);
+  const [isSubmitting, setIsSubmitting] = useState(false);
+  const navigate = useNavigate();
 
   const videoHelper = useMemo(
     () =>
@@ -72,8 +86,9 @@ export default function UploadPage() {
   const canSubmit =
     !currentErrors.title && !currentErrors.video && !currentErrors.thumbnail;
 
-  const handleSubmit = (event: FormEvent<HTMLFormElement>) => {
+  const handleSubmit = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
+    if (isSubmitting) return;
     setStatus('');
     setDidSubmitOnce(true);
 
@@ -85,7 +100,36 @@ export default function UploadPage() {
       return;
     }
 
-    setStatus('검증을 통과했어요! 실제 업로드 기능은 준비 중이에요.');
+    if (!videoFile || !thumbnailFile) {
+      setStatus('업로드할 파일을 찾을 수 없어요.');
+      return;
+    }
+
+    setIsSubmitting(true);
+    setStatus('로컬에 파일을 저장하고 있어요…');
+
+    try {
+      const videoId = generateVideoId();
+      const trimmedTitle = title.trim();
+
+      await dataSource.putVideoBlob(videoId, videoFile);
+      await dataSource.putThumbBlob(videoId, thumbnailFile);
+
+      const video = await dataSource.createVideo({ id: videoId, title: trimmedTitle });
+
+      queryClient.setQueryData(['videos'], (prev: Video[] | undefined) =>
+        prev ? [video, ...prev] : [video],
+      );
+      void queryClient.invalidateQueries({ queryKey: ['videos'] });
+
+      setStatus('업로드가 완료됐어요. 상세 페이지로 이동합니다.');
+      navigate(`/videos/${video.id}`);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : '업로드에 실패했어요.';
+      setStatus(message);
+    } finally {
+      setIsSubmitting(false);
+    }
   };
 
   return (
@@ -98,7 +142,7 @@ export default function UploadPage() {
       </div>
 
       <p style={{ color: '#444', margin: '12px 0 20px' }}>
-        파일 검증만 우선 지원돼요. 요구사항에 맞는지 확인만 하고 실제 저장은 진행되지 않아요.
+        업로드한 비디오/썸네일이 로컬(IndexedDB)에 저장되고, 업로드가 끝나면 상세 페이지로 이동해요.
       </p>
 
       <form
@@ -194,18 +238,18 @@ export default function UploadPage() {
 
         <button
           type="submit"
-          disabled={!canSubmit}
+          disabled={!canSubmit || isSubmitting}
           style={{
             padding: '12px 16px',
             borderRadius: 8,
             border: 'none',
-            background: canSubmit ? '#111' : '#999',
+            background: canSubmit && !isSubmitting ? '#111' : '#999',
             color: '#fff',
             fontWeight: 700,
-            cursor: canSubmit ? 'pointer' : 'not-allowed',
+            cursor: canSubmit && !isSubmitting ? 'pointer' : 'not-allowed',
           }}
         >
-          검증하기
+          {isSubmitting ? '업로드 중…' : '업로드하기'}
         </button>
 
         {status ? (

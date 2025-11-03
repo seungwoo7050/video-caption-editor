@@ -1,3 +1,10 @@
+import {
+  getThumbnailBlob as getStoredThumbnail,
+  getVideoBlob as getStoredVideo,
+  saveThumbnailBlob,
+  saveVideoBlob,
+} from '@/lib/localAssetStore'
+
 import { seededVideos } from './fixtures'
 
 import type { Caption, CreateVideoInput, DataSource, Video, VideoId } from './types'
@@ -21,7 +28,7 @@ export function createMockDataSource(): DataSource {
     async createVideo(input: CreateVideoInput): Promise<Video> {
       const now = Date.now()
       const v: Video = {
-        id: nextId(),
+        id: input.id ?? nextId(),
         title: input.title,
         createdAt: now,
       }
@@ -43,24 +50,22 @@ export function createMockDataSource(): DataSource {
       void _captions
     },
 
-    async putVideoBlob(_videoId: VideoId, _blob: Blob): Promise<void> {
-      void _videoId
-      void _blob
+    async putVideoBlob(videoId: VideoId, blob: Blob): Promise<void> {
+      await saveVideoBlob(videoId, blob)
     },
 
-    async getVideoBlob(_videoId: VideoId): Promise<Blob | null> {
-      void _videoId
-      return null
+    async getVideoBlob(videoId: VideoId): Promise<Blob | null> {
+      const stored = await getStoredVideo(videoId)
+      return stored?.blob ?? null
     },
 
-    async putThumbBlob(_videoId: VideoId, _blob: Blob): Promise<void> {
-      void _blob
-      void _videoId
+    async putThumbBlob(videoId: VideoId, blob: Blob): Promise<void> {
+      await saveThumbnailBlob(videoId, blob)
     },
 
-    async getThumbBlob(_videoId: VideoId): Promise<Blob | null> {
-      void _videoId
-      return null
+    async getThumbBlob(videoId: VideoId): Promise<Blob | null> {
+      const stored = await getStoredThumbnail(videoId)
+      return stored?.blob ?? null
     },
   }
 }

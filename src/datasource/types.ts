@@ -19,6 +19,7 @@ export type Caption = {
 
 export type CreateVideoInput = {
   title: string
+  id?: VideoId
 }
 
 export type DataSource = {
