@@ -40,6 +40,22 @@ export function createMockDataSource(): DataSource {
       videosById.delete(id)
     },
 
+    async updateVideoMetadata(
+      id: VideoId,
+      meta: Partial<Pick<Video, 'durationMs' | 'width' | 'height'>>,
+    ): Promise<void> {
+      const prev = videosById.get(id)
+      if (!prev) return
+
+      const next: Video = {
+        ...prev,
+        ...(typeof meta.durationMs === 'number' ? { durationMs: meta.durationMs } : null),
+        ...(typeof meta.width === 'number' ? { width: meta.width } : null),
+        ...(typeof meta.height === 'number' ? { height: meta.height } : null),
+      }
+      videosById.set(id, next)
+    },
+
     async listCaptions(_videoId: VideoId): Promise<Caption[]> {
       void _videoId
       return []

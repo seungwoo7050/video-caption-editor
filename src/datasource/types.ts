@@ -22,6 +22,8 @@ export type CreateVideoInput = {
   id?: VideoId
 }
 
+export type VideoMetadataPatch = Partial<Pick<Video, 'durationMs' | 'width' | 'height'>>;
+
 export type DataSource = {
   listVideos(): Promise<Video[]>
   getVideo(id: VideoId): Promise<Video | null>
@@ -35,6 +37,8 @@ export type DataSource = {
   getVideoBlob(videoId: VideoId): Promise<Blob | null>
   putThumbBlob(videoId: VideoId, blob: Blob): Promise<void>
   getThumbBlob(videoId: VideoId): Promise<Blob | null>
+
+  updateVideoMetadata(id: VideoId, patch: VideoMetadataPatch): Promise<void>;
 }
 
 export type DataSourceKind = 'mock' | 'api'

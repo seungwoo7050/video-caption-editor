@@ -1,4 +1,6 @@
 import type { Caption, CreateVideoInput, DataSource, Video, VideoId } from './types'
+import type { VideoMetadataPatch } from './types';
+
 
 export function createApiDataSource(): DataSource {
   return {
@@ -52,6 +54,11 @@ export function createApiDataSource(): DataSource {
     async getThumbBlob(_videoId: VideoId): Promise<Blob | null> {
       void _videoId
       throw new Error('API datasource not implemented yet')
+    },
+
+    async updateVideoMetadata(_id: string, _patch: VideoMetadataPatch): Promise<void> {
+      void _id;
+      void _patch;
     },
   }
 }
