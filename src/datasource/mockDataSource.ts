@@ -1,3 +1,4 @@
+import { getCaptions as loadCaptions, saveCaptions as persistCaptions } from '@/lib/captionStore'
 import {
   getThumbnailBlob as getStoredThumbnail,
   getVideoBlob as getStoredVideo,
@@ -56,14 +57,12 @@ export function createMockDataSource(): DataSource {
       videosById.set(id, next)
     },
 
-    async listCaptions(_videoId: VideoId): Promise<Caption[]> {
-      void _videoId
-      return []
+    async listCaptions(videoId: VideoId): Promise<Caption[]> {
+      return loadCaptions(videoId)
     },
 
-    async saveCaptions(_videoId: VideoId, _captions: Caption[]): Promise<void> {
-      void _videoId
-      void _captions
+    async saveCaptions(videoId: VideoId, captions: Caption[]): Promise<void> {
+      await persistCaptions(videoId, captions)
     },
 
     async putVideoBlob(videoId: VideoId, blob: Blob): Promise<void> {
