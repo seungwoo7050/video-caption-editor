@@ -1,22 +1,20 @@
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
 
 
 import { dataSource } from '@/datasource';
 import type { Video } from '@/datasource/types';
 import { queryClient } from '@/lib/queryClient';
+import { captureThumbnailFromFile } from '@/lib/thumbnailGenerator';
 
 import type { FormEvent } from 'react';
 
 const ACCEPTED_VIDEO_TYPES = ['video/mp4', 'video/webm', 'video/quicktime'];
-const ACCEPTED_THUMB_TYPES = ['image/jpeg', 'image/png', 'image/webp'];
 const MAX_VIDEO_SIZE = 200 * 1024 * 1024; // 200MB
-const MAX_THUMB_SIZE = 10 * 1024 * 1024; // 10MB
 
 type FormErrors = {
   title?: string;
   video?: string;
-  thumbnail?: string;
 };
 
 function validateTitle(raw: string) {
@@ -33,18 +31,10 @@ function validateVideoFile(file: File | null) {
   return undefined;
 }
 
-function validateThumbnailFile(file: File | null) {
-  if (!file) return '대표 썸네일을 선택해주세요.';
-  if (!ACCEPTED_THUMB_TYPES.includes(file.type)) return '썸네일은 JPG/PNG/WEBP만 지원해요.';
-  if (file.size > MAX_THUMB_SIZE) return '썸네일 용량이 너무 커요.';
-  return undefined;
-}
-
-function getErrors(input: { title: string; videoFile: File | null; thumbnailFile: File | null }): FormErrors {
+function getErrors(input: { title: string; videoFile: File | null }): FormErrors {
   return {
     title: validateTitle(input.title),
     video: validateVideoFile(input.videoFile),
-    thumbnail: validateThumbnailFile(input.thumbnailFile),
   };
 }
 
@@ -58,11 +48,14 @@ function generateVideoId() {
 export default function UploadPage() {
   const [title, setTitle] = useState('');
   const [videoFile, setVideoFile] = useState<File | null>(null);
-  const [thumbnailFile, setThumbnailFile] = useState<File | null>(null);
   const [errors, setErrors] = useState<FormErrors>({});
   const [status, setStatus] = useState<string>('');
   const [didSubmitOnce, setDidSubmitOnce] = useState(false);
   const [isSubmitting, setIsSubmitting] = useState(false);
+  const [thumbnailBlob, setThumbnailBlob] = useState<Blob | null>(null);
+  const [thumbnailUrl, setThumbnailUrl] = useState<string | null>(null);
+  const [thumbnailStatus, setThumbnailStatus] = useState<string>('썸네일 생성 전입니다.');
+  const [thumbnailError, setThumbnailError] = useState<string | null>(null);
   const navigate = useNavigate();
 
   const videoHelper = useMemo(
@@ -75,16 +68,48 @@ export default function UploadPage() {
   );
 
   const thumbHelper = useMemo(
-    () =>
-      [
-        `허용: ${ACCEPTED_THUMB_TYPES.join(', ')}`,
-        `최대 용량: ${(MAX_THUMB_SIZE / (1024 * 1024)).toFixed(0)}MB`,
-      ].join(' · '),
+    () => '영상 0.5초 지점에서 자동으로 캡처해요.',
     [],
   );
-  const currentErrors = getErrors({ title, videoFile, thumbnailFile });
-  const canSubmit =
-    !currentErrors.title && !currentErrors.video && !currentErrors.thumbnail;
+  const currentErrors = getErrors({ title, videoFile });
+  const canSubmit = !currentErrors.title && !currentErrors.video && Boolean(thumbnailBlob);
+
+  useEffect(() => {
+    let revokedUrl: string | null = null;
+    let cancelled = false;
+
+    if (!videoFile) {
+      setThumbnailBlob(null);
+      setThumbnailUrl(null);
+      setThumbnailStatus('썸네일 생성 전입니다.');
+      setThumbnailError(null);
+      return () => undefined;
+    }
+
+    setThumbnailBlob(null);
+    setThumbnailUrl(null);
+    setThumbnailError(null);
+    setThumbnailStatus('썸네일 생성 중이에요…');
+
+    captureThumbnailFromFile(videoFile, 0.5)
+      .then((blob) => {
+        if (cancelled) return;
+        setThumbnailBlob(blob);
+        revokedUrl = URL.createObjectURL(blob);
+        setThumbnailUrl(revokedUrl);
+        setThumbnailStatus('썸네일 생성 완료!');
+      })
+      .catch((error) => {
+        if (cancelled) return;
+        setThumbnailStatus('썸네일 생성에 실패했어요.');
+        setThumbnailError(error instanceof Error ? error.message : '알 수 없는 오류');
+      });
+
+    return () => {
+      cancelled = true;
+      if (revokedUrl) URL.revokeObjectURL(revokedUrl);
+    };
+  }, [videoFile]);
 
   const handleSubmit = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
@@ -92,16 +117,21 @@ export default function UploadPage() {
     setStatus('');
     setDidSubmitOnce(true);
 
-    const nextErrors = getErrors({ title, videoFile, thumbnailFile });
+    const nextErrors = getErrors({ title, videoFile });
     setErrors(nextErrors);
-    const ok = !nextErrors.title && !nextErrors.video && !nextErrors.thumbnail;
+    const ok = !nextErrors.title && !nextErrors.video;
     if (!ok) {
       setStatus('입력값을 다시 확인해주세요.');
       return;
     }
 
-    if (!videoFile || !thumbnailFile) {
-      setStatus('업로드할 파일을 찾을 수 없어요.');
+    if (!videoFile) {
+      setStatus('업로드할 영상 파일을 찾을 수 없어요.');
+      return;
+    }
+
+    if (!thumbnailBlob) {
+      setStatus('썸네일이 아직 준비되지 않았어요. 잠시 후 다시 시도해주세요.');
       return;
     }
 
@@ -113,7 +143,7 @@ export default function UploadPage() {
       const trimmedTitle = title.trim();
 
       await dataSource.putVideoBlob(videoId, videoFile);
-      await dataSource.putThumbBlob(videoId, thumbnailFile);
+      await dataSource.putThumbBlob(videoId, thumbnailBlob);
 
       const video = await dataSource.createVideo({ id: videoId, title: trimmedTitle });
 
@@ -211,31 +241,42 @@ export default function UploadPage() {
         </div>
 
         <div style={{ display: 'grid', gap: 8 }}>
-          <label htmlFor="thumbnail" style={{ fontWeight: 600 }}>
-            썸네일 이미지
-          </label>
-          <input
-            id="thumbnail"
-            name="thumbnail"
-            type="file"
-            accept={ACCEPTED_THUMB_TYPES.join(',')}
-            onChange={(event) => {
-              const file = event.target.files?.[0] ?? null;
-              setThumbnailFile(file);
-              setErrors((prev) => ({ ...prev, thumbnail: validateThumbnailFile(file) }));
+          <div style={{ display: 'flex', alignItems: 'baseline', gap: 8 }}>
+            <label htmlFor="thumbnail-preview" style={{ fontWeight: 600 }}>
+              자동 생성된 썸네일
+            </label>
+            <span style={{ color: '#666', fontSize: 12 }}>{thumbHelper}</span>
+          </div>
+          <div
+            id="thumbnail-preview"
+            style={{
+              border: '1px solid #e6e6e6',
+              borderRadius: 8,
+              padding: 12,
+              background: '#fafafa',
+              display: 'grid',
+              gap: 8,
             }}
-            aria-invalid={Boolean(errors.thumbnail)}
-          />
-          <p style={{ color: errors.thumbnail ? '#b00020' : '#666', margin: 0, fontSize: 13 }}>
-            {errors.thumbnail ?? thumbHelper}
-          </p>
-          {thumbnailFile ? (
-            <div style={{ fontSize: 13, color: '#333' }}>
-              선택된 파일: {thumbnailFile.name} ({(thumbnailFile.size / 1024).toFixed(0)}KB)
+          >
+            <div style={{ color: thumbnailError ? '#b00020' : '#444', fontSize: 14 }}>
+              {thumbnailStatus}
+              {thumbnailError ? ` (${thumbnailError})` : null}
             </div>
-          ) : null}
         </div>
-
+            {thumbnailUrl ? (
+              <img
+                src={thumbnailUrl}
+                alt="자동 생성된 비디오 썸네일"
+                style={{
+                  width: '100%',
+                  maxWidth: 320,
+                  borderRadius: 6,
+                  border: '1px solid #ddd',
+                  objectFit: 'cover',
+                }}
+              />
+            ) : null}
+          </div>
         <button
           type="submit"
           disabled={!canSubmit || isSubmitting}
@@ -257,8 +298,8 @@ export default function UploadPage() {
             style={{
               padding: 12,
               borderRadius: 8,
-              background: errors.title || errors.video || errors.thumbnail ? '#fff4f4' : '#f0fff2',
-              color: errors.title || errors.video || errors.thumbnail ? '#b00020' : '#1d7f32',
+              background: errors.title || errors.video ? '#fff4f4' : '#f0fff2',
+              color: errors.title || errors.video ? '#b00020' : '#1d7f32',
             }}
             aria-live="polite"
           >

@@ -69,6 +69,16 @@ export default function VideoDetailPage() {
     },
   });
 
+  const {
+    data: thumbnailBlob,
+    error: thumbnailBlobError,
+    isPending: isThumbLoading,
+  } = useQuery({
+    queryKey: ['thumbnail-blob', videoId],
+    enabled: Boolean(videoId),
+    queryFn: () => dataSource.getThumbBlob(videoId),
+  });  
+
   const videoUrl = useMemo(() => {
     if (!videoBlob) return null;
     return URL.createObjectURL(videoBlob);
@@ -79,6 +89,17 @@ export default function VideoDetailPage() {
       if (videoUrl) URL.revokeObjectURL(videoUrl);
     };
   }, [videoUrl]);
+
+  const thumbnailUrl = useMemo(() => {
+    if (!thumbnailBlob) return null;
+    return URL.createObjectURL(thumbnailBlob);
+  }, [thumbnailBlob]);
+
+  useEffect(() => {
+    return () => {
+      if (thumbnailUrl) URL.revokeObjectURL(thumbnailUrl);
+    };
+  }, [thumbnailUrl]);
 
   const handleMetadata = useCallback(
     (event: SyntheticEvent<HTMLVideoElement>) => {
@@ -169,12 +190,44 @@ export default function VideoDetailPage() {
                 {formatDate(video.createdAt)}
               </span>
             </div>
-            <div style={{ color: '#555', fontSize: 14 }}>
-              {formatMeta(video) || '메타데이터 없음'}
-              {isMetadataReady && formatMeta(video)
-                ? ' (추출됨)'
-                : null}
-            </div>
+              <div style={{ color: '#555', fontSize: 14 }}>
+                {formatMeta(video) || '메타데이터 없음'}
+                {isMetadataReady && formatMeta(video)
+                  ? ' (추출됨)'
+                  : null}
+              </div>
+            </section>
+
+          <section
+            style={{
+              padding: 16,
+              borderRadius: 10,
+              border: '1px solid #e6e6e6',
+              background: '#fff',
+            }}
+          >
+            <h3 style={{ margin: '0 0 12px' }}>썸네일</h3>
+            {isThumbLoading ? (
+              <p style={{ margin: 0 }}>썸네일을 불러오는 중이에요…</p>
+            ) : thumbnailBlobError ? (
+              <p style={{ margin: 0, color: '#b00020' }}>
+                썸네일을 불러오지 못했어요.
+              </p>
+            ) : thumbnailUrl ? (
+              <img
+                src={thumbnailUrl}
+                alt="저장된 비디오 썸네일"
+                style={{
+                  width: '100%',
+                  maxWidth: 360,
+                  borderRadius: 8,
+                  border: '1px solid #ddd',
+                  objectFit: 'cover',
+                }}
+              />
+            ) : (
+              <p style={{ margin: 0, color: '#555' }}>저장된 썸네일이 없어요.</p>
+            )}
           </section>
 
           <section
