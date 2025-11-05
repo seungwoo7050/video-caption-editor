@@ -109,6 +109,7 @@ export default function VideoDetailPage() {
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const captionRefs = useRef<Record<string, HTMLLIElement | null>>({});
   const [activeCaptionId, setActiveCaptionId] = useState<string | null>(null);
+  const [lastFocusedCaptionId, setLastFocusedCaptionId] = useState<string | null>(null);
   const timeUpdateRafIdRef = useRef<number | null>(null);
 
   const captionWorkerRef = useRef<Worker | null>(null);
@@ -125,7 +126,6 @@ export default function VideoDetailPage() {
         setActiveCaptionId((prev) =>
           prev !== message.activeCaptionId ? message.activeCaptionId : prev,
         );
-        console.debug('[worker->main] activeCaption', message);
         if (import.meta.env.DEV) console.debug('[worker->main] activeCaption', message);
         return;
       }
@@ -271,19 +271,112 @@ export default function VideoDetailPage() {
     [resetSaveCaptionsError],
   );
 
+  const getCurrentTimeMs = useCallback(() => {
+    const video = videoRef.current;
+    if (!video) return Number.NaN;
+
+    const currentTimeMs = Number.isFinite(video.currentTime)
+      ? Math.round(video.currentTime * 1000)
+      : Number.NaN;
+
+    return currentTimeMs;
+  }, []);
+
   const handleAddCaption = useCallback(() => {
     resetSaveCaptionsError();
+    const nextCaptionId = createCaptionId();
+    const currentTimeMs = getCurrentTimeMs();
     setCaptionDrafts((prev) => {
-      const startMs = getLastValidEndMs(prev);
+      const startMs = Number.isFinite(currentTimeMs) ? currentTimeMs : getLastValidEndMs(prev);
       const endMs = startMs + 1000;
-      const next = [...prev, { id: createCaptionId(), startMs, endMs, text: '' }];
+      const next = [...prev, { id: nextCaptionId, startMs, endMs, text: '' }];
       return sortCaptions(next);
     });
-  }, [resetSaveCaptionsError]);
+    setLastFocusedCaptionId(nextCaptionId);
+  }, [getCurrentTimeMs, resetSaveCaptionsError]);
+
+  const handleSetCaptionTimeFromVideo = useCallback(
+    (captionId: string, field: keyof Pick<Caption, 'startMs' | 'endMs'>) => {
+      const currentTimeMs = getCurrentTimeMs();
+      if (!Number.isFinite(currentTimeMs)) return;
+
+      handleCaptionFieldChange(captionId, field, currentTimeMs.toString());
+      setLastFocusedCaptionId(captionId);
+    },
+    [getCurrentTimeMs, handleCaptionFieldChange],
+  );
+
+  const togglePlayback = useCallback(() => {
+    const video = videoRef.current;
+    if (!video) return;
+
+    if (video.paused) {
+      void video.play();
+    } else {
+      video.pause();
+    }
+  }, []);
+
+  const getShortcutTargetCaptionId = useCallback(() => {
+    return (
+      lastFocusedCaptionId ??
+      activeCaptionId ??
+      captionDrafts[captionDrafts.length - 1]?.id ??
+      null
+    );
+  }, [activeCaptionId, captionDrafts, lastFocusedCaptionId]);
+
+  useEffect(() => {
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.metaKey || event.ctrlKey || event.altKey) return;
+
+      const target = event.target as HTMLElement | null;
+      const isTypingTarget =
+        target &&
+        (target.tagName === 'INPUT' ||
+          target.tagName === 'TEXTAREA' ||
+          target.tagName === 'SELECT' ||
+          target.tagName === 'BUTTON' ||
+          target.tagName === 'A' ||
+          target.isContentEditable);
+      if (isTypingTarget) return;
+
+      if (event.key === ' ') {
+        event.preventDefault();
+        togglePlayback();
+        return;
+      }
+
+      if (event.key === '[') {
+        event.preventDefault();
+        const targetCaptionId = getShortcutTargetCaptionId();
+        if (targetCaptionId) handleSetCaptionTimeFromVideo(targetCaptionId, 'startMs');
+        return;
+      }
+
+      if (event.key === ']') {
+        event.preventDefault();
+        const targetCaptionId = getShortcutTargetCaptionId();
+        if (targetCaptionId) handleSetCaptionTimeFromVideo(targetCaptionId, 'endMs');
+        return;
+      }
+
+      if (event.key === 'Enter') {
+        event.preventDefault();
+        handleAddCaption();
+      }
+    };
+
+    window.addEventListener('keydown', handleKeyDown);
+    return () => {
+      window.removeEventListener('keydown', handleKeyDown);
+    };
+  }, [getShortcutTargetCaptionId, handleAddCaption, handleSetCaptionTimeFromVideo, togglePlayback]);
 
   const handleDeleteCaption = useCallback((captionId: string) => {
     resetSaveCaptionsError();
     setCaptionDrafts((prev) => prev.filter((caption) => caption.id !== captionId));
+    setLastFocusedCaptionId((prev) => (prev === captionId ? null : prev));
   }, [resetSaveCaptionsError]);
 
   const handleSaveCaptions = useCallback(() => {
@@ -542,36 +635,72 @@ export default function VideoDetailPage() {
                       >
                         <label style={{ display: 'grid', gap: 4 }}>
                           <span style={{ fontSize: 12, color: '#555' }}>시작(ms)</span>
-                          <input
-                            type="number"
-                            min={0}
-                            value={Number.isFinite(caption.startMs) ? caption.startMs : ''}
-                            onChange={(e) =>
-                              handleCaptionFieldChange(caption.id, 'startMs', e.target.value)
-                            }
-                            style={{
-                              padding: '8px 10px',
-                              borderRadius: 6,
-                              border: '1px solid #ccc',
-                            }}
-                          />
+                          <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+                            <input
+                              type="number"
+                              min={0}
+                              value={Number.isFinite(caption.startMs) ? caption.startMs : ''}
+                              onChange={(e) =>
+                                handleCaptionFieldChange(caption.id, 'startMs', e.target.value)
+                              }
+                              onFocus={() => setLastFocusedCaptionId(caption.id)}
+                              style={{
+                                padding: '8px 10px',
+                                borderRadius: 6,
+                                border: '1px solid #ccc',
+                              }}
+                            />
+                            <button
+                              type="button"
+                              onClick={() => handleSetCaptionTimeFromVideo(caption.id, 'startMs')}
+                              style={{
+                                padding: '6px 10px',
+                                borderRadius: 6,
+                                border: '1px solid #ccc',
+                                cursor: 'pointer',
+                                background: '#f7f7f7',
+                                color: '#111',
+                                whiteSpace: 'nowrap',
+                              }}
+                            >
+                              현재 재생 위치로 설정
+                            </button>
+                          </div>
                           {errors.startMs ? (
                             <span style={{ color: '#b00020', fontSize: 12 }}>{errors.startMs}</span>
                           ) : null}
                         </label>
                         <label style={{ display: 'grid', gap: 4 }}>
                           <span style={{ fontSize: 12, color: '#555' }}>종료(ms)</span>
-                          <input
-                            type="number"
-                            min={0}
-                            value={Number.isFinite(caption.endMs) ? caption.endMs : ''}
-                            onChange={(e) => handleCaptionFieldChange(caption.id, 'endMs', e.target.value)}
-                            style={{
-                              padding: '8px 10px',
-                              borderRadius: 6,
-                              border: '1px solid #ccc',
-                            }}
-                          />
+                          <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+                            <input
+                              type="number"
+                              min={0}
+                              value={Number.isFinite(caption.endMs) ? caption.endMs : ''}
+                              onChange={(e) => handleCaptionFieldChange(caption.id, 'endMs', e.target.value)}
+                              onFocus={() => setLastFocusedCaptionId(caption.id)}
+                              style={{
+                                padding: '8px 10px',
+                                borderRadius: 6,
+                                border: '1px solid #ccc',
+                              }}
+                            />
+                            <button
+                              type="button"
+                              onClick={() => handleSetCaptionTimeFromVideo(caption.id, 'endMs')}
+                              style={{
+                                padding: '6px 10px',
+                                borderRadius: 6,
+                                border: '1px solid #ccc',
+                                cursor: 'pointer',
+                                background: '#f7f7f7',
+                                color: '#111',
+                                whiteSpace: 'nowrap',
+                              }}
+                            >
+                              현재 재생 위치로 설정
+                            </button>
+                          </div>
                           {errors.endMs ? (
                             <span style={{ color: '#b00020', fontSize: 12 }}>{errors.endMs}</span>
                           ) : null}
@@ -582,6 +711,7 @@ export default function VideoDetailPage() {
                             type="text"
                             value={caption.text}
                             onChange={(e) => handleCaptionFieldChange(caption.id, 'text', e.target.value)}
+                            onFocus={() => setLastFocusedCaptionId(caption.id)}
                             placeholder="자막을 입력하세요"
                             style={{
                               padding: '8px 10px',
