@@ -6,6 +6,7 @@ import { dataSource } from '@/datasource';
 import { dataSourceKind } from '@/datasource';
 import type { Caption, Video } from '@/datasource/types';
 import { queryClient } from '@/lib/queryClient';
+import type { CaptionWorkerRequest, CaptionWorkerResponse } from '@/workers/captionScanner.types';
 
 import type { SyntheticEvent } from 'react';
 
@@ -110,6 +111,39 @@ export default function VideoDetailPage() {
   const [activeCaptionId, setActiveCaptionId] = useState<string | null>(null);
   const timeUpdateRafIdRef = useRef<number | null>(null);
 
+  const captionWorkerRef = useRef<Worker | null>(null);
+
+  useEffect(() => {
+    const worker = new Worker(new URL('../workers/captionScanner.ts', import.meta.url), {
+      type: 'module',
+    });
+    captionWorkerRef.current = worker;
+
+    const handleMessage = (event: MessageEvent<CaptionWorkerResponse>) => {
+      const message = event.data;
+      if (message.type === 'activeCaption') {
+        setActiveCaptionId((prev) =>
+          prev !== message.activeCaptionId ? message.activeCaptionId : prev,
+        );
+        console.debug('[worker->main] activeCaption', message);
+        if (import.meta.env.DEV) console.debug('[worker->main] activeCaption', message);
+        return;
+      }
+
+      if (message.type === 'log') {
+        if (import.meta.env.DEV) console.debug('[worker->main]', message.message);
+      }
+    };
+
+    worker.addEventListener('message', handleMessage);
+
+    return () => {
+      worker.removeEventListener('message', handleMessage);
+      worker.terminate();
+      captionWorkerRef.current = null;
+    };
+  }, []);
+
   const {
     data: videoBlob,
     error: videoBlobError,
@@ -169,11 +203,28 @@ export default function VideoDetailPage() {
 
   useEffect(() => {
     if (captions) {
-      // 로컬 상태를 서버 응답과 동기화하기 위해 필요
       // eslint-disable-next-line react-hooks/set-state-in-effect
       setCaptionDrafts(sortCaptions(captions));
     }
   }, [captions]);
+
+  useEffect(() => {
+    const worker = captionWorkerRef.current;
+    if (!worker) return;
+
+    const syncMessage: CaptionWorkerRequest = { type: 'syncCaptions', captions: captionDrafts };
+    worker.postMessage(syncMessage);
+    if (import.meta.env.DEV) console.debug('[worker<-main] syncCaptions', captionDrafts.length);
+
+    const currentTime = videoRef.current?.currentTime;
+    if (Number.isFinite(currentTime)) {
+      const scanMessage: CaptionWorkerRequest = {
+        type: 'scanActiveCaption',
+        currentTimeMs: (currentTime as number) * 1000,
+      };
+      worker.postMessage(scanMessage);
+    }
+  }, [captionDrafts]);
 
   const hasCaptionErrors = useMemo(
     () => captionDrafts.some((c) => Object.keys(getCaptionErrors(c)).length > 0),
@@ -287,27 +338,6 @@ export default function VideoDetailPage() {
     [video, videoId],
   );
 
-  const determineActiveCaption = useCallback(
-    (currentTimeMs: number) => {
-      if (captionDrafts.length === 0) {
-        setActiveCaptionId((prev) => (prev !== null ? null : prev));
-        return;
-      }
-
-      let nextActiveId: string | null = null;
-      for (const caption of captionDrafts) {
-        if (!Number.isFinite(caption.startMs) || !Number.isFinite(caption.endMs)) continue;
-        if (currentTimeMs >= caption.startMs && currentTimeMs < caption.endMs) {
-          nextActiveId = caption.id;
-          break;
-        }
-      }
-
-      setActiveCaptionId((prev) => (prev !== nextActiveId ? nextActiveId : prev));
-    },
-    [captionDrafts],
-  );
-
   useEffect(() => {
     const target = videoRef.current;
     if (!target) return undefined;
@@ -320,7 +350,14 @@ export default function VideoDetailPage() {
           ? target.currentTime * 1000
           : Number.NaN;
         if (!Number.isFinite(currentTimeMs)) return;
-        determineActiveCaption(currentTimeMs);
+        const worker = captionWorkerRef.current;
+        if (!worker) return;
+
+        const message: CaptionWorkerRequest = {
+          type: 'scanActiveCaption',
+          currentTimeMs,
+        };
+        worker.postMessage(message);
       });
     };
 
@@ -335,7 +372,7 @@ export default function VideoDetailPage() {
         timeUpdateRafIdRef.current = null;
       }
     };
-  }, [determineActiveCaption]);
+  }, []);
 
   useEffect(() => {
     const liveIds = new Set(captionDrafts.map((c) => c.id));
@@ -343,19 +380,6 @@ export default function VideoDetailPage() {
       if (!liveIds.has(key)) delete captionRefs.current[key];
     }
   }, [captionDrafts]);
-
-useEffect(() => {
-  const currentTime = videoRef.current?.currentTime;
-  if (!Number.isFinite(currentTime)) return;
-
-  const currentTimeMs = (currentTime as number) * 1000;
-
-  const rafId = window.requestAnimationFrame(() => {
-    determineActiveCaption(currentTimeMs);
-  });
-
-  return () => window.cancelAnimationFrame(rafId);
-}, [captionDrafts, determineActiveCaption]);
 
   useEffect(() => {
     if (!activeCaptionId) return;
