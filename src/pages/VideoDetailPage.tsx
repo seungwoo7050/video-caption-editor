@@ -1,10 +1,10 @@
-import { useQuery } from '@tanstack/react-query';
+import { useMutation, useQuery } from '@tanstack/react-query';
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { Link, useParams } from 'react-router-dom';
 
 import { dataSource } from '@/datasource';
 import { dataSourceKind } from '@/datasource';
-import type { Video } from '@/datasource/types';
+import type { Caption, Video } from '@/datasource/types';
 import { queryClient } from '@/lib/queryClient';
 
 import type { SyntheticEvent } from 'react';
@@ -26,11 +26,61 @@ function formatMeta(video: Video) {
   return [duration, resolution].filter(Boolean).join(' · ');
 }
 
+type CaptionErrors = {
+  startMs?: string;
+  endMs?: string;
+  text?: string;
+};
+
+function sortCaptions(captions: Caption[]) {
+  return [...captions].sort((a, b) => {
+    const aStart = Number.isFinite(a.startMs) ? a.startMs : Number.POSITIVE_INFINITY;
+    const bStart = Number.isFinite(b.startMs) ? b.startMs : Number.POSITIVE_INFINITY;
+    return aStart - bStart;
+  });
+}
+
+function getLastValidEndMs(captions: Caption[]) {
+  for (let i = captions.length - 1; i >= 0; i -= 1) {
+    const endMs = captions[i]?.endMs;
+    if (Number.isFinite(endMs)) return endMs as number;
+  }
+  return 0;
+}
+
+function createCaptionId() {
+  return typeof crypto.randomUUID === 'function'
+    ? crypto.randomUUID()
+    : `caption_${Date.now()}_${Math.random().toString(16).slice(2)}`;
+}
+
+function getCaptionErrors(caption: Caption): CaptionErrors {
+  const errors: CaptionErrors = {};
+  const hasStart = Number.isFinite(caption.startMs);
+  const hasEnd = Number.isFinite(caption.endMs);
+
+  if (!hasStart) errors.startMs = '시작 시간을 입력하세요.';
+  if (!hasEnd) errors.endMs = '종료 시간을 입력하세요.';
+
+  if (hasStart && hasEnd && caption.startMs >= caption.endMs) {
+    errors.endMs = '종료 시간은 시작 시간보다 커야 해요.';
+  }
+
+  if (!caption.text.trim()) {
+    errors.text = '자막 내용을 입력하세요.';
+  }
+
+  return errors;
+}
+
 export default function VideoDetailPage() {
   const { id } = useParams<{ id: string }>();
 
   const videoId = id ?? '';
   const [appliedMetadataForId, setAppliedMetadataForId] = useState<string | null>(null);
+
+  const [captionDrafts, setCaptionDrafts] = useState<Caption[]>([]);
+  const [lastSavedAt, setLastSavedAt] = useState<number | null>(null);  
 
   const {
     data: video,
@@ -100,6 +150,90 @@ export default function VideoDetailPage() {
       if (thumbnailUrl) URL.revokeObjectURL(thumbnailUrl);
     };
   }, [thumbnailUrl]);
+
+  const {
+    data: captions,
+    isPending: isCaptionsLoading,
+    isError: isCaptionsError,
+    error: captionsError,
+  } = useQuery({
+    queryKey: ['captions', videoId],
+    enabled: Boolean(videoId),
+    queryFn: () => dataSource.listCaptions(videoId),
+  });
+
+  useEffect(() => {
+    if (captions) {
+      // 로컬 상태를 서버 응답과 동기화하기 위해 필요
+      // eslint-disable-next-line react-hooks/set-state-in-effect
+      setCaptionDrafts(sortCaptions(captions));
+    }
+  }, [captions]);
+
+  const hasCaptionErrors = useMemo(
+    () => captionDrafts.some((c) => Object.keys(getCaptionErrors(c)).length > 0),
+    [captionDrafts],
+  );
+
+  const {
+    mutate: persistCaptions,
+    isPending: isSavingCaptions,
+    isError: isSaveCaptionsError,
+    error: saveCaptionsError,
+    reset: resetSaveCaptionsError,
+  } = useMutation({
+    mutationFn: async (nextCaptions: Caption[]) => {
+      const sorted = sortCaptions(nextCaptions);
+      await dataSource.saveCaptions(videoId, sorted);
+      return sorted;
+    },
+    onSuccess: (saved) => {
+      queryClient.setQueryData(['captions', videoId], saved);
+      setCaptionDrafts(saved);
+      setLastSavedAt(Date.now());
+    },
+  });
+
+  const handleCaptionFieldChange = useCallback(
+    (captionId: string, field: keyof Pick<Caption, 'startMs' | 'endMs' | 'text'>, value: string) => {
+      resetSaveCaptionsError();
+      const nextNumber =
+        value.trim() === '' ? Number.NaN : Number(value);
+      setCaptionDrafts((prev) =>
+        sortCaptions(
+          prev.map((caption) =>
+            caption.id === captionId
+              ? {
+                  ...caption,
+                  [field]: field === 'text' ? value : nextNumber,
+                }
+              : caption,
+          ),
+        ),
+      );
+    },
+    [resetSaveCaptionsError],
+  );
+
+  const handleAddCaption = useCallback(() => {
+    resetSaveCaptionsError();
+    setCaptionDrafts((prev) => {
+      const startMs = getLastValidEndMs(prev);
+      const endMs = startMs + 1000;
+      const next = [...prev, { id: createCaptionId(), startMs, endMs, text: '' }];
+      return sortCaptions(next);
+    });
+  }, [resetSaveCaptionsError]);
+
+  const handleDeleteCaption = useCallback((captionId: string) => {
+    resetSaveCaptionsError();
+    setCaptionDrafts((prev) => prev.filter((caption) => caption.id !== captionId));
+  }, [resetSaveCaptionsError]);
+
+  const handleSaveCaptions = useCallback(() => {
+    if (!videoId || hasCaptionErrors) return;
+    persistCaptions(captionDrafts);
+  }, [captionDrafts, hasCaptionErrors, persistCaptions, videoId]);
 
   const handleMetadata = useCallback(
     (event: SyntheticEvent<HTMLVideoElement>) => {
@@ -197,6 +331,237 @@ export default function VideoDetailPage() {
                   : null}
               </div>
             </section>
+
+          <section
+            style={{
+              padding: 16,
+              borderRadius: 10,
+              border: '1px solid #e6e6e6',
+              background: '#fff',
+              display: 'grid',
+              gap: 12,
+            }}
+          >
+            <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+              <h3 style={{ margin: 0 }}>자막</h3>
+              <button
+                type="button"
+                onClick={handleAddCaption}
+                style={{
+                  padding: '6px 10px',
+                  borderRadius: 6,
+                  border: '1px solid #111',
+                  cursor: 'pointer',
+                  background: '#111',
+                  color: '#fff',
+                }}
+                disabled={isCaptionsLoading || isSavingCaptions}
+              >
+                새 자막 추가
+              </button>
+              <div style={{ flex: 1 }} />
+              {lastSavedAt ? (
+                <span style={{ color: '#666', fontSize: 12 }}>
+                  마지막 저장: {new Date(lastSavedAt).toLocaleTimeString()}
+                </span>
+              ) : null}
+            </div>
+
+            {isCaptionsLoading ? (
+              <p style={{ margin: 0 }}>자막을 불러오는 중이에요…</p>
+            ) : isCaptionsError ? (
+              <div
+                style={{
+                  padding: 12,
+                  borderRadius: 8,
+                  border: '1px solid #f2c4c4',
+                  background: '#fff6f6',
+                  color: '#b00020',
+                }}
+              >
+                <p style={{ margin: '0 0 6px' }}>자막을 불러오지 못했어요.</p>
+                <pre
+                  style={{
+                    margin: 0,
+                    padding: 8,
+                    borderRadius: 6,
+                    background: '#2f1317',
+                    color: '#ffeaea',
+                    whiteSpace: 'pre-wrap',
+                    wordBreak: 'break-all',
+                    fontSize: 12,
+                  }}
+                >
+                  {captionsError instanceof Error ? captionsError.message : String(captionsError)}
+                </pre>
+              </div>
+            ) : captionDrafts.length === 0 ? (
+              <p style={{ margin: 0, color: '#555' }}>
+                자막이 없어요. 새 자막을 추가해보세요.
+              </p>
+            ) : (
+              <ul style={{ listStyle: 'none', padding: 0, margin: 0, display: 'grid', gap: 12 }}>
+                {captionDrafts.map((caption) => {
+                  const errors = getCaptionErrors(caption);
+                  const hasError = Object.keys(errors).length > 0;
+                  return (
+                    <li
+                      key={caption.id}
+                      style={{
+                        border: '1px solid #e6e6e6',
+                        borderRadius: 10,
+                        padding: 12,
+                        background: hasError ? '#fffafa' : '#fdfdfd',
+                        display: 'grid',
+                        gap: 8,
+                      }}
+                    >
+                      <div
+                        style={{
+                          display: 'grid',
+                          gridTemplateColumns: 'repeat(auto-fit, minmax(160px, 1fr))',
+                          gap: 8,
+                          alignItems: 'center',
+                        }}
+                      >
+                        <label style={{ display: 'grid', gap: 4 }}>
+                          <span style={{ fontSize: 12, color: '#555' }}>시작(ms)</span>
+                          <input
+                            type="number"
+                            min={0}
+                            value={Number.isFinite(caption.startMs) ? caption.startMs : ''}
+                            onChange={(e) =>
+                              handleCaptionFieldChange(caption.id, 'startMs', e.target.value)
+                            }
+                            style={{
+                              padding: '8px 10px',
+                              borderRadius: 6,
+                              border: '1px solid #ccc',
+                            }}
+                          />
+                          {errors.startMs ? (
+                            <span style={{ color: '#b00020', fontSize: 12 }}>{errors.startMs}</span>
+                          ) : null}
+                        </label>
+                        <label style={{ display: 'grid', gap: 4 }}>
+                          <span style={{ fontSize: 12, color: '#555' }}>종료(ms)</span>
+                          <input
+                            type="number"
+                            min={0}
+                            value={Number.isFinite(caption.endMs) ? caption.endMs : ''}
+                            onChange={(e) => handleCaptionFieldChange(caption.id, 'endMs', e.target.value)}
+                            style={{
+                              padding: '8px 10px',
+                              borderRadius: 6,
+                              border: '1px solid #ccc',
+                            }}
+                          />
+                          {errors.endMs ? (
+                            <span style={{ color: '#b00020', fontSize: 12 }}>{errors.endMs}</span>
+                          ) : null}
+                        </label>
+                        <label style={{ display: 'grid', gap: 4 }}>
+                          <span style={{ fontSize: 12, color: '#555' }}>자막 내용</span>
+                          <input
+                            type="text"
+                            value={caption.text}
+                            onChange={(e) => handleCaptionFieldChange(caption.id, 'text', e.target.value)}
+                            placeholder="자막을 입력하세요"
+                            style={{
+                              padding: '8px 10px',
+                              borderRadius: 6,
+                              border: '1px solid #ccc',
+                            }}
+                          />
+                          {errors.text ? (
+                            <span style={{ color: '#b00020', fontSize: 12 }}>{errors.text}</span>
+                          ) : null}
+                        </label>
+                        <div style={{ display: 'flex', justifyContent: 'flex-end' }}>
+                          <button
+                            type="button"
+                            onClick={() => handleDeleteCaption(caption.id)}
+                            style={{
+                              padding: '8px 12px',
+                              borderRadius: 8,
+                              border: '1px solid #b00020',
+                              background: '#fff6f6',
+                              color: '#b00020',
+                              cursor: 'pointer',
+                              height: 'fit-content',
+                            }}
+                            aria-label="자막 삭제"
+                          >
+                            삭제
+                          </button>
+                        </div>
+                      </div>
+                    </li>
+                  );
+                })}
+              </ul>
+            )}
+
+            {isSaveCaptionsError ? (
+              <div
+                style={{
+                  padding: 12,
+                  borderRadius: 8,
+                  border: '1px solid #f2c4c4',
+                  background: '#fff6f6',
+                  color: '#b00020',
+                }}
+              >
+                <p style={{ margin: '0 0 6px' }}>자막 저장에 실패했어요.</p>
+                <pre
+                  style={{
+                    margin: 0,
+                    padding: 8,
+                    borderRadius: 6,
+                    background: '#2f1317',
+                    color: '#ffeaea',
+                    whiteSpace: 'pre-wrap',
+                    wordBreak: 'break-all',
+                    fontSize: 12,
+                  }}
+                >
+                  {saveCaptionsError instanceof Error ? saveCaptionsError.message : String(saveCaptionsError)}
+                </pre>
+              </div>
+            ) : null}
+
+            <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+              <button
+                type="button"
+                onClick={handleSaveCaptions}
+                disabled={
+                  isCaptionsLoading ||
+                  isSavingCaptions ||
+                  hasCaptionErrors ||
+                  captionDrafts.length === 0
+                }
+                style={{
+                  padding: '10px 14px',
+                  borderRadius: 8,
+                  border: 'none',
+                  background: '#111',
+                  color: '#fff',
+                  cursor: 'pointer',
+                }}
+              >
+                {isSavingCaptions ? '저장 중…' : '자막 저장'}
+              </button>
+              {hasCaptionErrors ? (
+                <span style={{ color: '#b00020', fontSize: 13 }}>
+                  모든 자막의 시작·종료 시간과 내용을 확인하세요.
+                </span>
+              ) : (
+                <span style={{ color: '#555', fontSize: 13 }}>
+                  시작 시간 오름차순으로 정렬되어 저장돼요.
+                </span>
+              )}
+            </div>
+          </section>
 
           <section
             style={{
