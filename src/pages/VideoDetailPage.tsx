@@ -1,5 +1,5 @@
 import { useMutation, useQuery } from '@tanstack/react-query';
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Link, useParams } from 'react-router-dom';
 
 import { dataSource } from '@/datasource';
@@ -104,6 +104,11 @@ export default function VideoDetailPage() {
   );
   const hasAppliedMetadata = appliedMetadataForId === videoId;
   const isMetadataReady = hasAppliedMetadata || hasExistingMetadata;
+
+  const videoRef = useRef<HTMLVideoElement | null>(null);
+  const captionRefs = useRef<Record<string, HTMLLIElement | null>>({});
+  const [activeCaptionId, setActiveCaptionId] = useState<string | null>(null);
+  const timeUpdateRafIdRef = useRef<number | null>(null);
 
   const {
     data: videoBlob,
@@ -282,6 +287,84 @@ export default function VideoDetailPage() {
     [video, videoId],
   );
 
+  const determineActiveCaption = useCallback(
+    (currentTimeMs: number) => {
+      if (captionDrafts.length === 0) {
+        setActiveCaptionId((prev) => (prev !== null ? null : prev));
+        return;
+      }
+
+      let nextActiveId: string | null = null;
+      for (const caption of captionDrafts) {
+        if (!Number.isFinite(caption.startMs) || !Number.isFinite(caption.endMs)) continue;
+        if (currentTimeMs >= caption.startMs && currentTimeMs < caption.endMs) {
+          nextActiveId = caption.id;
+          break;
+        }
+      }
+
+      setActiveCaptionId((prev) => (prev !== nextActiveId ? nextActiveId : prev));
+    },
+    [captionDrafts],
+  );
+
+  useEffect(() => {
+    const target = videoRef.current;
+    if (!target) return undefined;
+
+    const handleTimeUpdate = () => {
+      if (timeUpdateRafIdRef.current !== null) return;
+      timeUpdateRafIdRef.current = window.requestAnimationFrame(() => {
+        timeUpdateRafIdRef.current = null;
+        const currentTimeMs = Number.isFinite(target.currentTime)
+          ? target.currentTime * 1000
+          : Number.NaN;
+        if (!Number.isFinite(currentTimeMs)) return;
+        determineActiveCaption(currentTimeMs);
+      });
+    };
+
+    target.addEventListener('timeupdate', handleTimeUpdate);
+    target.addEventListener('seeking', handleTimeUpdate);
+
+    return () => {
+      target.removeEventListener('timeupdate', handleTimeUpdate);
+      target.removeEventListener('seeking', handleTimeUpdate);
+      if (timeUpdateRafIdRef.current !== null) {
+        window.cancelAnimationFrame(timeUpdateRafIdRef.current);
+        timeUpdateRafIdRef.current = null;
+      }
+    };
+  }, [determineActiveCaption]);
+
+  useEffect(() => {
+    const liveIds = new Set(captionDrafts.map((c) => c.id));
+    for (const key of Object.keys(captionRefs.current)) {
+      if (!liveIds.has(key)) delete captionRefs.current[key];
+    }
+  }, [captionDrafts]);
+
+useEffect(() => {
+  const currentTime = videoRef.current?.currentTime;
+  if (!Number.isFinite(currentTime)) return;
+
+  const currentTimeMs = (currentTime as number) * 1000;
+
+  const rafId = window.requestAnimationFrame(() => {
+    determineActiveCaption(currentTimeMs);
+  });
+
+  return () => window.cancelAnimationFrame(rafId);
+}, [captionDrafts, determineActiveCaption]);
+
+  useEffect(() => {
+    if (!activeCaptionId) return;
+    const target = captionRefs.current[activeCaptionId];
+    if (!target) return;
+
+    target.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+  }, [activeCaptionId]);
+
   return (
     <main style={{ padding: 24, maxWidth: 960, margin: '0 auto' }}>
       <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
@@ -404,15 +487,24 @@ export default function VideoDetailPage() {
                 {captionDrafts.map((caption) => {
                   const errors = getCaptionErrors(caption);
                   const hasError = Object.keys(errors).length > 0;
+                  const isActive = activeCaptionId === caption.id;
                   return (
                     <li
                       key={caption.id}
+                      ref={(node) => {
+                        captionRefs.current[caption.id] = node;
+                      }}
                       style={{
-                        border: '1px solid #e6e6e6',
+                        border: isActive ? '1px solid #111' : '1px solid #e6e6e6',
                         borderRadius: 10,
                         padding: 12,
-                        background: hasError ? '#fffafa' : '#fdfdfd',
+                        background: hasError
+                          ? '#fffafa'
+                          : isActive
+                            ? '#f5f8ff'
+                            : '#fdfdfd',
                         display: 'grid',
+                        boxShadow: isActive ? '0 0 0 2px #dfe8ff' : undefined,
                         gap: 8,
                       }}
                     >
@@ -621,6 +713,7 @@ export default function VideoDetailPage() {
             ) : videoUrl ? (
               <video
                 key={videoUrl}
+                ref={videoRef}
                 src={videoUrl}
                 controls
                 style={{ width: '100%', borderRadius: 8, background: '#000' }}
