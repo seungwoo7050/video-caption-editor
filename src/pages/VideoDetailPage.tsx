@@ -9,7 +9,7 @@ import { captionsToSrt, downloadTextFile, parseCaptionsFromJson, serializeCaptio
 import { queryClient } from '@/lib/queryClient';
 import type { CaptionWorkerRequest, CaptionWorkerResponse } from '@/workers/captionScanner.types';
 
-import type { ChangeEvent, SyntheticEvent } from 'react';
+import type { ChangeEvent, PointerEvent as ReactPointerEvent, SyntheticEvent } from 'react';
 
 function formatDate(ms: number) {
   return new Date(ms).toLocaleString();
@@ -56,6 +56,24 @@ function createCaptionId() {
     : `caption_${Date.now()}_${Math.random().toString(16).slice(2)}`;
 }
 
+function snapToStep(ms: number, stepMs: number) {
+  if (!Number.isFinite(ms) || stepMs <= 0) return ms;
+  return Math.round(ms / stepMs) * stepMs;
+}
+
+function formatTimestamp(ms: number) {
+  if (!Number.isFinite(ms)) return '--:--.---';
+  const totalSeconds = Math.max(0, Math.floor(ms / 1000));
+  const minutes = Math.floor(totalSeconds / 60)
+    .toString()
+    .padStart(2, '0');
+  const seconds = (totalSeconds % 60).toString().padStart(2, '0');
+  const milliseconds = Math.abs(ms % 1000)
+    .toString()
+    .padStart(3, '0');
+  return `${minutes}:${seconds}.${milliseconds}`;
+}
+
 function getCaptionErrors(caption: Caption): CaptionErrors {
   const errors: CaptionErrors = {};
   const hasStart = Number.isFinite(caption.startMs);
@@ -84,6 +102,12 @@ export default function VideoDetailPage() {
   const [captionDrafts, setCaptionDrafts] = useState<Caption[]>([]);
   const [lastSavedAt, setLastSavedAt] = useState<number | null>(null);
   const [importError, setImportError] = useState<string | null>(null);
+  const [durationMs, setDurationMs] = useState<number | null>(null);
+  const [trimRange, setTrimRange] = useState<{ startMs: number; endMs: number } | null>(null);
+  const [snapStepMs, setSnapStepMs] = useState<100 | 1000>(100);
+  const timelineRef = useRef<HTMLDivElement | null>(null);
+  const trimRangeRef = useRef<{ startMs: number; endMs: number } | null>(null);
+  const [dragTarget, setDragTarget] = useState<'start' | 'end' | 'new' | null>(null);
 
   const {
     data: video,
@@ -480,9 +504,32 @@ export default function VideoDetailPage() {
       }
 
       setAppliedMetadataForId(videoId);
+      if (typeof durationMs === 'number') setDurationMs(durationMs);
     },
     [video, videoId],
   );
+
+  useEffect(() => {
+    if (typeof video?.durationMs === 'number') {
+      setDurationMs(video.durationMs);
+    }
+  }, [video]);
+
+  useEffect(() => {
+    if (typeof durationMs !== 'number') return;
+    setTrimRange((prev) => {
+      if (prev && Number.isFinite(prev.startMs) && Number.isFinite(prev.endMs)) {
+        const clampedStart = Math.max(0, Math.min(prev.startMs, durationMs));
+        const clampedEnd = Math.max(clampedStart, Math.min(prev.endMs, durationMs));
+        return { startMs: clampedStart, endMs: clampedEnd };
+      }
+      return { startMs: 0, endMs: durationMs };
+    });
+  }, [durationMs]);
+
+  useEffect(() => {
+    trimRangeRef.current = trimRange;
+  }, [trimRange]);
 
   const drawWaveform = useCallback(() => {
     const canvas = waveformCanvasRef.current;
@@ -675,6 +722,121 @@ export default function VideoDetailPage() {
 
     target.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
   }, [activeCaptionId]);
+
+  const effectiveDurationMs = useMemo(() => {
+    if (typeof durationMs === 'number') return durationMs;
+    if (typeof video?.durationMs === 'number') return video.durationMs;
+    return null;
+  }, [durationMs, video]);
+
+  const selection = useMemo(() => {
+    if (!trimRange || typeof effectiveDurationMs !== 'number') return null;
+    const startMs = Math.max(0, Math.min(trimRange.startMs, effectiveDurationMs));
+    const endMs = Math.max(startMs, Math.min(trimRange.endMs, effectiveDurationMs));
+    const widthPct = effectiveDurationMs === 0 ? 0 : ((endMs - startMs) / effectiveDurationMs) * 100;
+    const leftPct = effectiveDurationMs === 0 ? 0 : (startMs / effectiveDurationMs) * 100;
+    return { startMs, endMs, widthPct, leftPct, durationMs: endMs - startMs };
+  }, [effectiveDurationMs, trimRange]);
+
+  const clampToDuration = useCallback(
+    (ms: number) => {
+      const maxDuration = effectiveDurationMs ?? Number.NaN;
+      if (!Number.isFinite(maxDuration)) return Math.max(0, ms);
+      return Math.min(Math.max(ms, 0), maxDuration);
+    },
+    [effectiveDurationMs],
+  );
+
+  const updateTrimRange = useCallback(
+    (next: { startMs: number; endMs: number }) => {
+      setTrimRange((prev) => {
+        const snappedStart = snapToStep(next.startMs, snapStepMs);
+        const snappedEnd = snapToStep(next.endMs, snapStepMs);
+        const clampedStart = clampToDuration(Math.min(snappedStart, snappedEnd));
+        const clampedEnd = clampToDuration(Math.max(snappedStart, snappedEnd));
+        if (prev && clampedStart === prev.startMs && clampedEnd === prev.endMs) return prev;
+        return { startMs: clampedStart, endMs: clampedEnd };
+      });
+    },
+    [clampToDuration, snapStepMs],
+  );
+
+  const handleNudge = useCallback(
+    (target: 'start' | 'end', deltaMs: number) => {
+      setTrimRange((prev) => {
+        if (!prev) return prev;
+        const nextStart = target === 'start' ? clampToDuration(prev.startMs + deltaMs) : prev.startMs;
+        const nextEnd = target === 'end' ? clampToDuration(prev.endMs + deltaMs) : prev.endMs;
+        return {
+          startMs: Math.min(nextStart, nextEnd),
+          endMs: Math.max(nextStart, nextEnd),
+        };
+      });
+    },
+    [clampToDuration],
+  );
+
+  const handleTimelinePointerDown = useCallback(
+    (event: ReactPointerEvent<HTMLDivElement>) => {
+      if (typeof effectiveDurationMs !== 'number' || effectiveDurationMs <= 0) return;
+      const rect = timelineRef.current?.getBoundingClientRect();
+      if (!rect || rect.width <= 0) return;
+      const ratio = (event.clientX - rect.left) / rect.width;
+      const ms = clampToDuration(ratio * effectiveDurationMs);
+      setDragTarget('new');
+      updateTrimRange({ startMs: ms, endMs: ms });
+      trimRangeRef.current = { startMs: ms, endMs: ms };
+      window.getSelection()?.removeAllRanges();
+    },
+    [clampToDuration, effectiveDurationMs, updateTrimRange],
+  );
+
+  const handlePointerMove = useCallback(
+    (event: PointerEvent) => {
+      if (!dragTarget || typeof effectiveDurationMs !== 'number' || effectiveDurationMs <= 0) return;
+      const rect = timelineRef.current?.getBoundingClientRect();
+      if (!rect || rect.width <= 0) return;
+      const ratio = (event.clientX - rect.left) / rect.width;
+      const ms = clampToDuration(ratio * effectiveDurationMs);
+      setTrimRange((prev) => {
+        if (!prev) return prev;
+        if (dragTarget === 'start') {
+          const next = { startMs: ms, endMs: prev.endMs };
+          trimRangeRef.current = next;
+          return next;
+        }
+        if (dragTarget === 'end') {
+          const next = { startMs: prev.startMs, endMs: ms };
+          trimRangeRef.current = next;
+          return next;
+        }
+        const next = { startMs: prev.startMs, endMs: ms };
+        trimRangeRef.current = next;
+        return next;
+      });
+    },
+    [clampToDuration, dragTarget, effectiveDurationMs],
+  );
+
+  const handlePointerUp = useCallback(() => {
+    if (!dragTarget) return;
+    const latest = trimRangeRef.current;
+    if (!latest) return;
+
+    setDragTarget(null);
+    updateTrimRange(latest);
+  }, [dragTarget, updateTrimRange]);
+  useEffect(() => {
+    if (!dragTarget) return undefined;
+    window.addEventListener('pointermove', handlePointerMove);
+    window.addEventListener('pointerup', handlePointerUp);
+    window.addEventListener('pointercancel', handlePointerUp);
+    return () => {
+      window.removeEventListener('pointermove', handlePointerMove);
+      window.removeEventListener('pointerup', handlePointerUp);
+      window.removeEventListener('pointercancel', handlePointerUp);
+    };
+  }, [dragTarget, handlePointerMove, handlePointerUp]);
 
   return (
     <main style={{ padding: 24, maxWidth: 960, margin: '0 auto' }}>
@@ -1125,6 +1287,188 @@ export default function VideoDetailPage() {
                 >
                   <track kind="captions" />
                 </video>
+                <div
+                  style={{
+                    marginTop: 12,
+                    padding: '10px 12px',
+                    borderRadius: 8,
+                    background: '#f8fafc',
+                    border: '1px solid #e2e8f0',
+                    display: 'grid',
+                    gap: 10,
+                  }}
+                >
+                  <div
+                    style={{
+                      display: 'flex',
+                      alignItems: 'center',
+                      justifyContent: 'space-between',
+                      gap: 12,
+                      flexWrap: 'wrap',
+                    }}
+                  >
+                    <p style={{ margin: 0, color: '#111', fontWeight: 600 }}>트리밍 구간</p>
+                    <div style={{ display: 'flex', gap: 12, flexWrap: 'wrap', fontSize: 13 }}>
+                      <span style={{ color: '#111' }}>
+                        시작: <strong>{selection ? formatTimestamp(selection.startMs) : '--:--.---'}</strong>
+                      </span>
+                      <span style={{ color: '#111' }}>
+                        종료: <strong>{selection ? formatTimestamp(selection.endMs) : '--:--.---'}</strong>
+                      </span>
+                      <span style={{ color: '#555' }}>
+                        길이: {selection ? formatTimestamp(selection.durationMs) : '--:--.---'}
+                      </span>
+                    </div>
+                  </div>
+                  <div
+                    ref={timelineRef}
+                    onPointerDown={handleTimelinePointerDown}
+                    style={{
+                      position: 'relative',
+                      height: 32,
+                      borderRadius: 16,
+                      background: '#e5e7eb',
+                      cursor: 'crosshair',
+                      touchAction: 'none',
+                      overflow: 'hidden',
+                    }}
+                    aria-label="트리밍 구간 선택"
+                  >
+                    {selection ? (
+                      <div
+                        style={{
+                          position: 'absolute',
+                          left: `${selection.leftPct}%`,
+                          width: `${selection.widthPct}%`,
+                          top: 0,
+                          bottom: 0,
+                          background: 'rgba(43, 123, 255, 0.2)',
+                          border: '1px solid #2b7bff',
+                          borderRadius: 16,
+                          minWidth: 8,
+                        }}
+                      >
+                        <div
+                          role="separator"
+                          aria-label="시작 지점 조절"
+                          onPointerDown={(event) => {
+                            event.stopPropagation();
+                            event.preventDefault();
+                            setDragTarget('start');
+                          }}
+                          style={{
+                            position: 'absolute',
+                            left: -6,
+                            top: -6,
+                            bottom: -6,
+                            width: 12,
+                            borderRadius: 4,
+                            background: '#2b7bff',
+                            cursor: 'ew-resize',
+                          }}
+                        />
+                        <div
+                          role="separator"
+                          aria-label="종료 지점 조절"
+                          onPointerDown={(event) => {
+                            event.stopPropagation();
+                            event.preventDefault();
+                            setDragTarget('end');
+                          }}
+                          style={{
+                            position: 'absolute',
+                            right: -6,
+                            top: -6,
+                            bottom: -6,
+                            width: 12,
+                            borderRadius: 4,
+                            background: '#2b7bff',
+                            cursor: 'ew-resize',
+                          }}
+                        />
+                      </div>
+                    ) : null}
+                  </div>
+                  <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center' }}>
+                    <span style={{ fontSize: 13, color: '#333' }}>스냅:</span>
+                    {[100, 1000].map((step) => (
+                      <button
+                        key={step}
+                        type="button"
+                        onClick={() => setSnapStepMs(step as 100 | 1000)}
+                        style={{
+                          padding: '6px 10px',
+                          borderRadius: 6,
+                          border: snapStepMs === step ? '1px solid #2b7bff' : '1px solid #d0d7e2',
+                          background: snapStepMs === step ? '#e8f0ff' : '#fff',
+                          color: '#111',
+                          cursor: 'pointer',
+                        }}
+                      >
+                        {step === 100 ? '100ms' : '1s'}
+                      </button>
+                    ))}
+                    <span style={{ fontSize: 13, color: '#333', marginLeft: 8 }}>미세 조정:</span>
+                    <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
+                      <button
+                        type="button"
+                        onClick={() => handleNudge('start', -snapStepMs)}
+                        disabled={!selection}
+                        style={{
+                          padding: '6px 10px',
+                          borderRadius: 6,
+                          border: '1px solid #d0d7e2',
+                          background: '#fff',
+                          cursor: selection ? 'pointer' : 'not-allowed',
+                        }}
+                      >
+                        시작 -{snapStepMs}ms
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => handleNudge('start', snapStepMs)}
+                        disabled={!selection}
+                        style={{
+                          padding: '6px 10px',
+                          borderRadius: 6,
+                          border: '1px solid #d0d7e2',
+                          background: '#fff',
+                          cursor: selection ? 'pointer' : 'not-allowed',
+                        }}
+                      >
+                        시작 +{snapStepMs}ms
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => handleNudge('end', -snapStepMs)}
+                        disabled={!selection}
+                        style={{
+                          padding: '6px 10px',
+                          borderRadius: 6,
+                          border: '1px solid #d0d7e2',
+                          background: '#fff',
+                          cursor: selection ? 'pointer' : 'not-allowed',
+                        }}
+                      >
+                        종료 -{snapStepMs}ms
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => handleNudge('end', snapStepMs)}
+                        disabled={!selection}
+                        style={{
+                          padding: '6px 10px',
+                          borderRadius: 6,
+                          border: '1px solid #d0d7e2',
+                          background: '#fff',
+                          cursor: selection ? 'pointer' : 'not-allowed',
+                        }}
+                      >
+                        종료 +{snapStepMs}ms
+                      </button>
+                    </div>
+                  </div>
+                </div>
                 <div
                   style={{
                     marginTop: 12,
