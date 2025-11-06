@@ -109,6 +109,12 @@ export default function VideoDetailPage() {
   const isMetadataReady = hasAppliedMetadata || hasExistingMetadata;
 
   const videoRef = useRef<HTMLVideoElement | null>(null);
+  const waveformCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  const audioContextRef = useRef<AudioContext | null>(null);
+  const analyserRef = useRef<AnalyserNode | null>(null);
+  const mediaSourceRef = useRef<MediaElementAudioSourceNode | null>(null);
+  const waveformDataRef = useRef<Uint8Array | null>(null);
+  const waveformRafIdRef = useRef<number | null>(null);  
   const captionRefs = useRef<Record<string, HTMLLIElement | null>>({});
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const [activeCaptionId, setActiveCaptionId] = useState<string | null>(null);
@@ -477,6 +483,147 @@ export default function VideoDetailPage() {
     },
     [video, videoId],
   );
+
+  const drawWaveform = useCallback(() => {
+    const canvas = waveformCanvasRef.current;
+    const analyser = analyserRef.current;
+    const dataArray = waveformDataRef.current;
+    if (!canvas || !analyser || !dataArray) return;
+
+    const context = canvas.getContext('2d');
+    if (!context) return;
+
+    const typedDataArray = dataArray as unknown as Uint8Array<ArrayBuffer>;
+
+    const dpr = window.devicePixelRatio || 1;
+    const width = canvas.clientWidth * dpr;
+    const height = canvas.clientHeight * dpr || 1;
+    if (canvas.width !== width || canvas.height !== height) {
+      canvas.width = width;
+      canvas.height = height;
+    }
+
+    analyser.getByteTimeDomainData(typedDataArray);
+
+    context.clearRect(0, 0, width, height);
+    context.lineWidth = 2;
+    context.strokeStyle = '#2b7bff';
+
+    context.beginPath();
+    const sliceWidth = width / typedDataArray.length;
+    let x = 0;
+
+    for (let i = 0; i < typedDataArray.length; i += 1) {
+      const value = typedDataArray[i] ?? 128;
+      const v = value / 128.0;
+      const y = (v * height) / 2;
+
+      if (i === 0) {
+        context.moveTo(x, y);
+      } else {
+        context.lineTo(x, y);
+      }
+
+      x += sliceWidth;
+    }
+
+    context.stroke();
+    waveformRafIdRef.current = window.requestAnimationFrame(drawWaveform);
+  }, []);
+
+  const stopWaveform = useCallback(() => {
+    if (waveformRafIdRef.current !== null) {
+      window.cancelAnimationFrame(waveformRafIdRef.current);
+      waveformRafIdRef.current = null;
+    }
+  }, []);
+
+  const startWaveform = useCallback(() => {
+    stopWaveform();
+    waveformRafIdRef.current = window.requestAnimationFrame(drawWaveform);
+  }, [drawWaveform, stopWaveform]);
+
+  useEffect(() => {
+    const videoElement = videoRef.current;
+    if (!videoElement || !videoUrl) return undefined;
+
+    const AudioContextClass =
+      window.AudioContext ?? (window as typeof window & { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
+    if (!AudioContextClass) return undefined;
+
+    let context: AudioContext | null = null;
+    let source: MediaElementAudioSourceNode | null = null;
+    let analyser: AnalyserNode | null = null;
+
+    try {
+      context = new AudioContextClass();
+      audioContextRef.current = context;
+
+      source = context.createMediaElementSource(videoElement);
+      mediaSourceRef.current = source;
+
+      analyser = context.createAnalyser();
+      analyser.fftSize = 2048;
+      analyserRef.current = analyser;
+
+      source.connect(analyser);
+      analyser.connect(context.destination);
+
+      waveformDataRef.current =
+        new Uint8Array(analyser.frequencyBinCount) as unknown as Uint8Array<ArrayBuffer>;
+    } catch {
+      audioContextRef.current = null;
+      analyserRef.current = null;
+      mediaSourceRef.current = null;
+      waveformDataRef.current = null;
+      return undefined;
+    }
+
+    const handlePlay = () => {
+      if (!context) return;
+      void context.resume().catch(() => null);
+      startWaveform();
+    };
+
+    const handlePause = () => {
+      stopWaveform();
+    };
+
+    const handleEnded = () => {
+      stopWaveform();
+    };
+
+    videoElement.addEventListener('play', handlePlay);
+    videoElement.addEventListener('pause', handlePause);
+    videoElement.addEventListener('ended', handleEnded);
+
+    if (!videoElement.paused && !videoElement.ended) {
+      if (context) void context.resume().catch(() => null);
+      startWaveform();
+    }
+
+    return () => {
+      stopWaveform();
+      videoElement.removeEventListener('play', handlePlay);
+      videoElement.removeEventListener('pause', handlePause);
+      videoElement.removeEventListener('ended', handleEnded);
+
+      try {
+        analyser?.disconnect();
+        source?.disconnect();
+      } catch (err) {
+        if (import.meta.env.DEV) {
+          console.debug('[waveform] cleanup failed', err);
+        }
+      }
+      if (context) void context.close().catch(() => null);
+
+      audioContextRef.current = null;
+      analyserRef.current = null;
+      mediaSourceRef.current = null;
+      waveformDataRef.current = null;
+    };
+  }, [startWaveform, stopWaveform, videoUrl]);
 
   useEffect(() => {
     const target = videoRef.current;
@@ -967,16 +1114,33 @@ export default function VideoDetailPage() {
                 영상 파일을 불러오지 못했어요.
               </div>
             ) : videoUrl ? (
-              <video
-                key={videoUrl}
-                ref={videoRef}
-                src={videoUrl}
-                controls
-                style={{ width: '100%', borderRadius: 8, background: '#000' }}
-                onLoadedMetadata={handleMetadata}
-              >
-                <track kind="captions" />
-              </video>
+              <>
+                <video
+                  key={videoUrl}
+                  ref={videoRef}
+                  src={videoUrl}
+                  controls
+                  style={{ width: '100%', borderRadius: 8, background: '#000' }}
+                  onLoadedMetadata={handleMetadata}
+                >
+                  <track kind="captions" />
+                </video>
+                <div
+                  style={{
+                    marginTop: 12,
+                    padding: '10px 12px',
+                    borderRadius: 8,
+                    background: '#f7f9fb',
+                    border: '1px solid #e2e8f0',
+                  }}
+                >
+                  <p style={{ margin: '0 0 8px', color: '#333', fontSize: 14 }}>오디오 파형</p>
+                  <canvas
+                    ref={waveformCanvasRef}
+                    style={{ width: '100%', height: 96, display: 'block' }}
+                  />
+                </div>
+              </>
             ) : (
               <p style={{ margin: 0 }}>재생할 수 있는 영상이 없어요.</p>
             )}
