@@ -5,10 +5,11 @@ import { Link, useParams } from 'react-router-dom';
 import { dataSource } from '@/datasource';
 import { dataSourceKind } from '@/datasource';
 import type { Caption, Video } from '@/datasource/types';
+import { captionsToSrt, downloadTextFile, parseCaptionsFromJson, serializeCaptionsToJson } from '@/lib/captionIO';
 import { queryClient } from '@/lib/queryClient';
 import type { CaptionWorkerRequest, CaptionWorkerResponse } from '@/workers/captionScanner.types';
 
-import type { SyntheticEvent } from 'react';
+import type { ChangeEvent, SyntheticEvent } from 'react';
 
 function formatDate(ms: number) {
   return new Date(ms).toLocaleString();
@@ -81,7 +82,8 @@ export default function VideoDetailPage() {
   const [appliedMetadataForId, setAppliedMetadataForId] = useState<string | null>(null);
 
   const [captionDrafts, setCaptionDrafts] = useState<Caption[]>([]);
-  const [lastSavedAt, setLastSavedAt] = useState<number | null>(null);  
+  const [lastSavedAt, setLastSavedAt] = useState<number | null>(null);
+  const [importError, setImportError] = useState<string | null>(null);
 
   const {
     data: video,
@@ -108,6 +110,7 @@ export default function VideoDetailPage() {
 
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const captionRefs = useRef<Record<string, HTMLLIElement | null>>({});
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
   const [activeCaptionId, setActiveCaptionId] = useState<string | null>(null);
   const [lastFocusedCaptionId, setLastFocusedCaptionId] = useState<string | null>(null);
   const timeUpdateRafIdRef = useRef<number | null>(null);
@@ -203,7 +206,7 @@ export default function VideoDetailPage() {
 
   useEffect(() => {
     if (captions) {
-      // eslint-disable-next-line react-hooks/set-state-in-effect
+       
       setCaptionDrafts(sortCaptions(captions));
     }
   }, [captions]);
@@ -253,6 +256,7 @@ export default function VideoDetailPage() {
   const handleCaptionFieldChange = useCallback(
     (captionId: string, field: keyof Pick<Caption, 'startMs' | 'endMs' | 'text'>, value: string) => {
       resetSaveCaptionsError();
+      setImportError(null);
       const nextNumber =
         value.trim() === '' ? Number.NaN : Number(value);
       setCaptionDrafts((prev) =>
@@ -284,6 +288,7 @@ export default function VideoDetailPage() {
 
   const handleAddCaption = useCallback(() => {
     resetSaveCaptionsError();
+    setImportError(null);
     const nextCaptionId = createCaptionId();
     const currentTimeMs = getCurrentTimeMs();
     setCaptionDrafts((prev) => {
@@ -304,6 +309,47 @@ export default function VideoDetailPage() {
       setLastFocusedCaptionId(captionId);
     },
     [getCurrentTimeMs, handleCaptionFieldChange],
+  );
+
+  const baseFileName = useMemo(() => {
+    if (!video) return 'captions';
+    const safeTitle = video.title.replace(/[^a-zA-Z0-9-_]+/g, '_').replace(/_+/g, '_');
+    const trimmed = safeTitle.replace(/^_+|_+$/g, '');
+    return trimmed || 'captions';
+  }, [video]);
+
+  const handleExportJson = useCallback(() => {
+    const json = serializeCaptionsToJson(captionDrafts);
+    downloadTextFile(`${baseFileName}.json`, json, 'application/json;charset=utf-8');
+  }, [baseFileName, captionDrafts]);
+
+  const handleExportSrt = useCallback(() => {
+    const srt = captionsToSrt(captionDrafts);
+    downloadTextFile(`${baseFileName}.srt`, srt, 'application/x-subrip;charset=utf-8');
+  }, [baseFileName, captionDrafts]);
+
+  const handleImportJsonClick = useCallback(() => {
+    fileInputRef.current?.click();
+  }, []);
+
+  const handleImportJsonFile = useCallback(
+    async (event: ChangeEvent<HTMLInputElement>) => {
+      const file = event.target.files?.[0];
+      if (!file) return;
+
+      try {
+        const text = await file.text();
+        const imported = parseCaptionsFromJson(text, createCaptionId);
+        setCaptionDrafts(sortCaptions(imported));
+        setImportError(null);
+        resetSaveCaptionsError();
+      } catch (err) {
+        setImportError(err instanceof Error ? err.message : '자막 JSON을 불러오지 못했어요.');
+      } finally {
+        event.target.value = '';
+      }
+    },
+    [resetSaveCaptionsError],
   );
 
   const togglePlayback = useCallback(() => {
@@ -375,6 +421,7 @@ export default function VideoDetailPage() {
 
   const handleDeleteCaption = useCallback((captionId: string) => {
     resetSaveCaptionsError();
+    setImportError(null);
     setCaptionDrafts((prev) => prev.filter((caption) => caption.id !== captionId));
     setLastFocusedCaptionId((prev) => (prev === captionId ? null : prev));
   }, [resetSaveCaptionsError]);
@@ -807,6 +854,61 @@ export default function VideoDetailPage() {
                 </span>
               )}
             </div>
+            <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', marginTop: 8 }}>
+              <input
+                ref={fileInputRef}
+                type="file"
+                accept="application/json"
+                style={{ display: 'none' }}
+                onChange={handleImportJsonFile}
+              />
+              <button
+                type="button"
+                onClick={handleImportJsonClick}
+                style={{
+                  padding: '9px 12px',
+                  borderRadius: 8,
+                  border: '1px solid #ccc',
+                  background: '#f8f8f8',
+                  color: '#111',
+                  cursor: 'pointer',
+                }}
+              >
+                JSON 불러오기
+              </button>
+              <button
+                type="button"
+                onClick={handleExportJson}
+                style={{
+                  padding: '9px 12px',
+                  borderRadius: 8,
+                  border: '1px solid #ccc',
+                  background: '#f8f8f8',
+                  color: '#111',
+                  cursor: 'pointer',
+                }}
+              >
+                JSON 내보내기
+              </button>
+              <button
+                type="button"
+                onClick={handleExportSrt}
+                style={{
+                  padding: '9px 12px',
+                  borderRadius: 8,
+                  border: '1px solid #ccc',
+                  background: '#f8f8f8',
+                  color: '#111',
+                  cursor: 'pointer',
+                }}
+              >
+                SRT 내보내기
+              </button>
+            </div>
+
+            {importError ? (
+              <p style={{ margin: '8px 0 0', color: '#b00020' }}>{importError}</p>
+            ) : null}
           </section>
 
           <section
