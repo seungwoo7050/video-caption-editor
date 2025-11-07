@@ -366,7 +366,8 @@ export default function VideoDetailPage() {
     const trimEnd = Math.max(trimStart, Math.max(startMs, endMs));
     if (trimEnd <= trimStart) return [];
 
-    return captionDrafts
+    const trimmed = captionDrafts
+      .filter((caption) => Number.isFinite(caption.startMs) && Number.isFinite(caption.endMs))
       .filter((caption) => caption.endMs > trimStart && caption.startMs < trimEnd)
       .map((caption) => {
         const clippedStart = Math.max(caption.startMs, trimStart);
@@ -377,6 +378,7 @@ export default function VideoDetailPage() {
           endMs: clippedEnd - trimStart,
         };
       });
+    return sortCaptions(trimmed);
   }, [applyTrimOnExport, captionDrafts, trimRange]);
 
   const handleExportJson = useCallback(() => {
@@ -1208,11 +1210,15 @@ export default function VideoDetailPage() {
                 <input
                   type="checkbox"
                   checked={applyTrimOnExport}
+                  disabled={!trimRange}
                   onChange={(event) => setApplyTrimOnExport(event.target.checked)}
                 />
                 <span style={{ fontSize: 14, color: '#111' }}>
                   선택 구간만 내보내기
                   <span style={{ color: '#666', marginLeft: 6, fontSize: 12 }}>(시작 시간을 0으로 맞춰 저장)</span>
+                  {!trimRange ? (
+                    <span style={{ color: '#666', marginLeft: 6, fontSize: 12 }}>(트림 구간을 먼저 선택)</span>
+                  ) : null}
                 </span>
               </label>
               <button
