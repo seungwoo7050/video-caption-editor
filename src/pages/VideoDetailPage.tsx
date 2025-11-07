@@ -5,9 +5,9 @@ import { Link, useParams } from 'react-router-dom';
 import { dataSource } from '@/datasource';
 import { dataSourceKind } from '@/datasource';
 import type { Caption, Video } from '@/datasource/types';
+import { getActiveCaptionAtMs } from '@/lib/captionActive';
 import { captionsToSrt, downloadTextFile, parseCaptionsFromJson, serializeCaptionsToJson } from '@/lib/captionIO';
 import { queryClient } from '@/lib/queryClient';
-import type { CaptionWorkerRequest, CaptionWorkerResponse } from '@/workers/captionScanner.types';
 
 import type { ChangeEvent, PointerEvent as ReactPointerEvent, SyntheticEvent } from 'react';
 
@@ -141,44 +141,13 @@ export default function VideoDetailPage() {
   const analyserRef = useRef<AnalyserNode | null>(null);
   const mediaSourceRef = useRef<MediaElementAudioSourceNode | null>(null);
   const waveformDataRef = useRef<Uint8Array | null>(null);
-  const waveformRafIdRef = useRef<number | null>(null);  
+  const waveformRafIdRef = useRef<number | null>(null);
   const captionRefs = useRef<Record<string, HTMLLIElement | null>>({});
   const fileInputRef = useRef<HTMLInputElement | null>(null);
-  const [activeCaptionId, setActiveCaptionId] = useState<string | null>(null);
+  const [currentTimeMs, setCurrentTimeMs] = useState<number | null>(null);
   const [lastFocusedCaptionId, setLastFocusedCaptionId] = useState<string | null>(null);
-  const timeUpdateRafIdRef = useRef<number | null>(null);
-
-  const captionWorkerRef = useRef<Worker | null>(null);
-
-  useEffect(() => {
-    const worker = new Worker(new URL('../workers/captionScanner.ts', import.meta.url), {
-      type: 'module',
-    });
-    captionWorkerRef.current = worker;
-
-    const handleMessage = (event: MessageEvent<CaptionWorkerResponse>) => {
-      const message = event.data;
-      if (message.type === 'activeCaption') {
-        setActiveCaptionId((prev) =>
-          prev !== message.activeCaptionId ? message.activeCaptionId : prev,
-        );
-        if (import.meta.env.DEV) console.debug('[worker->main] activeCaption', message);
-        return;
-      }
-
-      if (message.type === 'log') {
-        if (import.meta.env.DEV) console.debug('[worker->main]', message.message);
-      }
-    };
-
-    worker.addEventListener('message', handleMessage);
-
-    return () => {
-      worker.removeEventListener('message', handleMessage);
-      worker.terminate();
-      captionWorkerRef.current = null;
-    };
-  }, []);
+  const videoFrameRequestIdRef = useRef<number | null>(null);
+  const animationFrameIdRef = useRef<number | null>(null);
 
   const {
     data: videoBlob,
@@ -209,12 +178,16 @@ export default function VideoDetailPage() {
     return URL.createObjectURL(videoBlob);
   }, [videoBlob]);
 
+  const activeCaption = useMemo(() => {
+    return getActiveCaptionAtMs(captionDrafts, currentTimeMs ?? Number.NaN);
+  }, [captionDrafts, currentTimeMs]);
+
+  const activeCaptionId = activeCaption?.id ?? null;
+
   const activeCaptionText = useMemo(() => {
-    if (!activeCaptionId) return null;
-    const matched = captionDrafts.find((caption) => caption.id === activeCaptionId);
-    const text = matched?.text.trim();
+    const text = activeCaption?.text.trim();
     return text ? text : null;
-  }, [activeCaptionId, captionDrafts]);
+  }, [activeCaption]);
 
   useEffect(() => {
     return () => {
@@ -246,28 +219,10 @@ export default function VideoDetailPage() {
 
   useEffect(() => {
     if (captions) {
-       
+
       setCaptionDrafts(sortCaptions(captions));
     }
   }, [captions]);
-
-  useEffect(() => {
-    const worker = captionWorkerRef.current;
-    if (!worker) return;
-
-    const syncMessage: CaptionWorkerRequest = { type: 'syncCaptions', captions: captionDrafts };
-    worker.postMessage(syncMessage);
-    if (import.meta.env.DEV) console.debug('[worker<-main] syncCaptions', captionDrafts.length);
-
-    const currentTime = videoRef.current?.currentTime;
-    if (Number.isFinite(currentTime)) {
-      const scanMessage: CaptionWorkerRequest = {
-        type: 'scanActiveCaption',
-        currentTimeMs: (currentTime as number) * 1000,
-      };
-      worker.postMessage(scanMessage);
-    }
-  }, [captionDrafts]);
 
   const hasCaptionErrors = useMemo(
     () => captionDrafts.some((c) => Object.keys(getCaptionErrors(c)).length > 0),
@@ -325,6 +280,53 @@ export default function VideoDetailPage() {
 
     return currentTimeMs;
   }, []);
+
+  const updateCurrentTime = useCallback(() => {
+    const next = getCurrentTimeMs();
+    setCurrentTimeMs(Number.isFinite(next) ? next : null);
+  }, [getCurrentTimeMs]);
+
+  const cancelTimeTracking = useCallback(() => {
+    const video = videoRef.current;
+    if (video && typeof video.cancelVideoFrameCallback === 'function' && videoFrameRequestIdRef.current !== null) {
+      video.cancelVideoFrameCallback(videoFrameRequestIdRef.current);
+    }
+    if (animationFrameIdRef.current !== null) {
+      window.cancelAnimationFrame(animationFrameIdRef.current);
+    }
+    videoFrameRequestIdRef.current = null;
+    animationFrameIdRef.current = null;
+  }, []);
+
+  const scheduleTimeTracking = useCallback(() => {
+    const video = videoRef.current;
+    if (!video) return;
+
+    cancelTimeTracking();
+
+    if (typeof video.requestVideoFrameCallback === 'function') {
+      const tick: VideoFrameRequestCallback = () => {
+        updateCurrentTime();
+        videoFrameRequestIdRef.current = video.requestVideoFrameCallback(tick);
+      };
+
+      videoFrameRequestIdRef.current = video.requestVideoFrameCallback(tick);
+      return;
+    }
+
+    if (video.paused || video.ended) return;
+
+    const loop = () => {
+      updateCurrentTime();
+      if (!video.paused && !video.ended) {
+        animationFrameIdRef.current = window.requestAnimationFrame(loop);
+      } else {
+        animationFrameIdRef.current = null;
+      }
+    };
+
+    animationFrameIdRef.current = window.requestAnimationFrame(loop);
+  }, [cancelTimeTracking, updateCurrentTime]);
 
   const handleAddCaption = useCallback(() => {
     resetSaveCaptionsError();
@@ -710,42 +712,6 @@ export default function VideoDetailPage() {
   }, [startWaveform, stopWaveform, videoUrl]);
 
   useEffect(() => {
-    const target = videoRef.current;
-    if (!target) return undefined;
-
-    const handleTimeUpdate = () => {
-      if (timeUpdateRafIdRef.current !== null) return;
-      timeUpdateRafIdRef.current = window.requestAnimationFrame(() => {
-        timeUpdateRafIdRef.current = null;
-        const currentTimeMs = Number.isFinite(target.currentTime)
-          ? target.currentTime * 1000
-          : Number.NaN;
-        if (!Number.isFinite(currentTimeMs)) return;
-        const worker = captionWorkerRef.current;
-        if (!worker) return;
-
-        const message: CaptionWorkerRequest = {
-          type: 'scanActiveCaption',
-          currentTimeMs,
-        };
-        worker.postMessage(message);
-      });
-    };
-
-    target.addEventListener('timeupdate', handleTimeUpdate);
-    target.addEventListener('seeking', handleTimeUpdate);
-
-    return () => {
-      target.removeEventListener('timeupdate', handleTimeUpdate);
-      target.removeEventListener('seeking', handleTimeUpdate);
-      if (timeUpdateRafIdRef.current !== null) {
-        window.cancelAnimationFrame(timeUpdateRafIdRef.current);
-        timeUpdateRafIdRef.current = null;
-      }
-    };
-  }, []);
-
-  useEffect(() => {
     const liveIds = new Set(captionDrafts.map((c) => c.id));
     for (const key of Object.keys(captionRefs.current)) {
       if (!liveIds.has(key)) delete captionRefs.current[key];
@@ -874,6 +840,55 @@ export default function VideoDetailPage() {
       window.removeEventListener('pointercancel', handlePointerUp);
     };
   }, [dragTarget, handlePointerMove, handlePointerUp]);
+
+  useEffect(() => {
+    const video = videoRef.current;
+    if (!video) return undefined;
+
+    updateCurrentTime();
+
+    const handleTimeUpdate = () => updateCurrentTime();
+    const handleSeeked = () => updateCurrentTime();
+    const handleSeeking = () => updateCurrentTime();
+    const handleLoadedMetadata = () => updateCurrentTime();
+    const handlePlay = () => {
+      updateCurrentTime();
+      scheduleTimeTracking();
+    };
+    const handlePause = () => {
+      updateCurrentTime();
+      cancelTimeTracking();
+    };
+    const handleEnded = () => {
+      updateCurrentTime();
+      cancelTimeTracking();
+    };
+
+    video.addEventListener('timeupdate', handleTimeUpdate);
+    video.addEventListener('seeking', handleSeeking);
+    video.addEventListener('seeked', handleSeeked);
+    video.addEventListener('seeking', handleSeeking);
+    video.addEventListener('loadedmetadata', handleLoadedMetadata);
+    video.addEventListener('play', handlePlay);
+    video.addEventListener('pause', handlePause);
+    video.addEventListener('ended', handleEnded);
+
+    if (!video.paused && !video.ended) {
+      scheduleTimeTracking();
+    }
+
+    return () => {
+      cancelTimeTracking();
+      video.removeEventListener('timeupdate', handleTimeUpdate);
+      video.removeEventListener('seeking', handleSeeking);
+      video.removeEventListener('seeked', handleSeeked);
+      video.removeEventListener('seeking', handleSeeking);
+      video.removeEventListener('loadedmetadata', handleLoadedMetadata);
+      video.removeEventListener('play', handlePlay);
+      video.removeEventListener('pause', handlePause);
+      video.removeEventListener('ended', handleEnded);
+    };
+  }, [videoUrl, cancelTimeTracking, scheduleTimeTracking, updateCurrentTime]);
 
   return (
     <main className="video-detail-page">
