@@ -104,6 +104,7 @@ export default function VideoDetailPage() {
   const [importError, setImportError] = useState<string | null>(null);
   const [durationMs, setDurationMs] = useState<number | null>(null);
   const [trimRange, setTrimRange] = useState<{ startMs: number; endMs: number } | null>(null);
+  const [applyTrimOnExport, setApplyTrimOnExport] = useState(false);
   const [snapStepMs, setSnapStepMs] = useState<100 | 1000>(100);
   const timelineRef = useRef<HTMLDivElement | null>(null);
   const trimRangeRef = useRef<{ startMs: number; endMs: number } | null>(null);
@@ -355,15 +356,40 @@ export default function VideoDetailPage() {
     return trimmed || 'captions';
   }, [video]);
 
+  const getCaptionsForExport = useCallback(() => {
+    if (!applyTrimOnExport || !trimRange) return captionDrafts;
+
+    const { startMs, endMs } = trimRange;
+    if (!Number.isFinite(startMs) || !Number.isFinite(endMs)) return captionDrafts;
+
+    const trimStart = Math.max(0, Math.min(startMs, endMs));
+    const trimEnd = Math.max(trimStart, Math.max(startMs, endMs));
+    if (trimEnd <= trimStart) return [];
+
+    return captionDrafts
+      .filter((caption) => caption.endMs > trimStart && caption.startMs < trimEnd)
+      .map((caption) => {
+        const clippedStart = Math.max(caption.startMs, trimStart);
+        const clippedEnd = Math.min(caption.endMs, trimEnd);
+        return {
+          ...caption,
+          startMs: clippedStart - trimStart,
+          endMs: clippedEnd - trimStart,
+        };
+      });
+  }, [applyTrimOnExport, captionDrafts, trimRange]);
+
   const handleExportJson = useCallback(() => {
-    const json = serializeCaptionsToJson(captionDrafts);
+    const captionsForExport = getCaptionsForExport();
+    const json = serializeCaptionsToJson(captionsForExport);
     downloadTextFile(`${baseFileName}.json`, json, 'application/json;charset=utf-8');
-  }, [baseFileName, captionDrafts]);
+  }, [baseFileName, getCaptionsForExport]);
 
   const handleExportSrt = useCallback(() => {
-    const srt = captionsToSrt(captionDrafts);
+    const captionsForExport = getCaptionsForExport();
+    const srt = captionsToSrt(captionsForExport);
     downloadTextFile(`${baseFileName}.srt`, srt, 'application/x-subrip;charset=utf-8');
-  }, [baseFileName, captionDrafts]);
+  }, [baseFileName, getCaptionsForExport]);
 
   const handleImportJsonClick = useCallback(() => {
     fileInputRef.current?.click();
@@ -1178,6 +1204,17 @@ export default function VideoDetailPage() {
                 style={{ display: 'none' }}
                 onChange={handleImportJsonFile}
               />
+              <label style={{ display: 'inline-flex', alignItems: 'center', gap: 6, marginRight: 12 }}>
+                <input
+                  type="checkbox"
+                  checked={applyTrimOnExport}
+                  onChange={(event) => setApplyTrimOnExport(event.target.checked)}
+                />
+                <span style={{ fontSize: 14, color: '#111' }}>
+                  선택 구간만 내보내기
+                  <span style={{ color: '#666', marginLeft: 6, fontSize: 12 }}>(시작 시간을 0으로 맞춰 저장)</span>
+                </span>
+              </label>
               <button
                 type="button"
                 onClick={handleImportJsonClick}
