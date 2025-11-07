@@ -206,6 +206,13 @@ export default function VideoDetailPage() {
     return URL.createObjectURL(videoBlob);
   }, [videoBlob]);
 
+  const activeCaptionText = useMemo(() => {
+    if (!activeCaptionId) return null;
+    const matched = captionDrafts.find((caption) => caption.id === activeCaptionId);
+    const text = matched?.text.trim();
+    return text ? text : null;
+  }, [activeCaptionId, captionDrafts]);
+
   useEffect(() => {
     return () => {
       if (videoUrl) URL.revokeObjectURL(videoUrl);
@@ -1277,16 +1284,40 @@ export default function VideoDetailPage() {
               </div>
             ) : videoUrl ? (
               <>
-                <video
-                  key={videoUrl}
-                  ref={videoRef}
-                  src={videoUrl}
-                  controls
-                  style={{ width: '100%', borderRadius: 8, background: '#000' }}
-                  onLoadedMetadata={handleMetadata}
-                >
-                  <track kind="captions" />
-                </video>
+                <div style={{ position: 'relative' }}>
+                  <video
+                    key={videoUrl}
+                    ref={videoRef}
+                    src={videoUrl}
+                    controls
+                    style={{ width: '100%', borderRadius: 8, background: '#000' }}
+                    onLoadedMetadata={handleMetadata}
+                  >
+                    <track kind="captions" />
+                  </video>
+                  {activeCaptionText ? (
+                    <div
+                      style={{
+                        position: 'absolute',
+                        left: '50%',
+                        bottom: 24,
+                        transform: 'translateX(-50%)',
+                        background: 'rgba(0, 0, 0, 0.7)',
+                        color: '#fff',
+                        borderRadius: 8,
+                        padding: '8px 12px',
+                        maxWidth: 'calc(100% - 24px)',
+                        textAlign: 'center',
+                        boxShadow: '0 8px 20px rgba(0, 0, 0, 0.25)',
+                        fontSize: 16,
+                        lineHeight: 1.5,
+                        pointerEvents: 'none',
+                      }}
+                    >
+                      {activeCaptionText}
+                    </div>
+                  ) : null}
+                </div>
                 <div
                   style={{
                     marginTop: 12,
