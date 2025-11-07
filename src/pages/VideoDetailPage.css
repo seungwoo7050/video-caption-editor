@@ -1,0 +1,44 @@
+.video-detail-page {
+  padding: 24px;
+  margin: 0 auto;
+  max-width: 1280px;
+  box-sizing: border-box;
+}
+
+.video-detail-sections {
+  margin-top: 16px;
+  display: grid;
+  gap: 16px;
+  grid-template-areas:
+    'meta'
+    'captions'
+    'thumbnail'
+    'player';
+}
+
+.video-detail-meta {
+  grid-area: meta;
+}
+
+.video-detail-captions {
+  grid-area: captions;
+}
+
+.video-detail-thumbnail {
+  grid-area: thumbnail;
+}
+
+.video-detail-player {
+  grid-area: player;
+}
+
+@media (min-width: 1024px) {
+  .video-detail-sections {
+    grid-template-columns: minmax(0, 1.1fr) minmax(0, 0.9fr);
+    grid-template-areas:
+      'meta meta'
+      'player captions'
+      'thumbnail captions';
+    align-items: start;
+  }
+}

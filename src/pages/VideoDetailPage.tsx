@@ -11,6 +11,8 @@ import type { CaptionWorkerRequest, CaptionWorkerResponse } from '@/workers/capt
 
 import type { ChangeEvent, PointerEvent as ReactPointerEvent, SyntheticEvent } from 'react';
 
+import './VideoDetailPage.css';
+
 function formatDate(ms: number) {
   return new Date(ms).toLocaleString();
 }
@@ -874,7 +876,7 @@ export default function VideoDetailPage() {
   }, [dragTarget, handlePointerMove, handlePointerUp]);
 
   return (
-    <main style={{ padding: 24, maxWidth: 960, margin: '0 auto' }}>
+    <main className="video-detail-page">
       <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
         <h1 style={{ margin: 0 }}>비디오 상세</h1>
         <Link to="/videos" style={{ fontSize: 14, color: '#555' }}>
@@ -898,8 +900,9 @@ export default function VideoDetailPage() {
           <p style={{ margin: 0 }}>비디오를 찾지 못했어요.</p>
         </div>
       ) : (
-        <div style={{ marginTop: 16, display: 'grid', gap: 16 }}>
+        <div className="video-detail-sections">
           <section
+            className="video-detail-meta"
             style={{
               padding: 16,
               borderRadius: 10,
@@ -924,6 +927,7 @@ export default function VideoDetailPage() {
             </section>
 
           <section
+            className="video-detail-captions"
             style={{
               padding: 16,
               borderRadius: 10,
@@ -1271,6 +1275,7 @@ export default function VideoDetailPage() {
           </section>
 
           <section
+            className="video-detail-thumbnail"
             style={{
               padding: 16,
               borderRadius: 10,
@@ -1303,6 +1308,7 @@ export default function VideoDetailPage() {
           </section>
 
           <section
+            className="video-detail-player"
             style={{
               padding: 16,
               borderRadius: 10,
