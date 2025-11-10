@@ -8,6 +8,7 @@ import type { Caption, Video } from '@/datasource/types';
 import { getActiveCaptionAtMs } from '@/lib/captionActive';
 import { captionsToSrt, downloadTextFile, parseCaptionsFromJson, serializeCaptionsToJson } from '@/lib/captionIO';
 import { queryClient } from '@/lib/queryClient';
+import type { WaveformWorkerRequest, WaveformWorkerResponse } from '@/workers/waveformWorker';
 
 import type { ChangeEvent, PointerEvent as ReactPointerEvent, SyntheticEvent } from 'react';
 
@@ -161,10 +162,23 @@ export default function VideoDetailPage() {
   const mediaSourceRef = useRef<MediaElementAudioSourceNode | null>(null);
   const waveformDataRef = useRef<Uint8Array | null>(null);
   const waveformRafIdRef = useRef<number | null>(null);
+  const waveformWorkerRef = useRef<Worker | null>(null);
+  const waveformWorkerResolversRef = useRef<Map<number, (response: WaveformWorkerResponse) => void>>(new Map());
+  const waveformRequestIdRef = useRef(0);
+  const waveformSamplesReadyRef = useRef(false);
+  const waveformOverviewPeaksRef = useRef<Int16Array | null>(null);
+  const waveformBucketCountRef = useRef<number | null>(null);
+  const waveformPendingBucketRef = useRef<number | null>(null);
+  const waveformComputeTimeoutRef = useRef<number | null>(null);
+  const waveformComputeTokenRef = useRef<number>(0);
+  const waveformLastComputeAtRef = useRef<number>(0);
+  const waveformModeRef = useRef<'overview' | 'live' | 'loading'>('loading');
+  const currentTimeMsRef = useRef<number | null>(null);
   const captionRefs = useRef<Record<string, HTMLLIElement | null>>({});
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const [currentTimeMs, setCurrentTimeMs] = useState<number | null>(null);
   const [lastFocusedCaptionId, setLastFocusedCaptionId] = useState<string | null>(null);
+  const [shouldUseLiveWaveform, setShouldUseLiveWaveform] = useState(false);
   const videoFrameRequestIdRef = useRef<number | null>(null);
   const animationFrameIdRef = useRef<number | null>(null);
   const webglResourcesRef = useRef<WebglResources | null>(null);
@@ -230,6 +244,46 @@ export default function VideoDetailPage() {
       if (thumbnailUrl) URL.revokeObjectURL(thumbnailUrl);
     };
   }, [thumbnailUrl]);
+
+  useEffect(() => {
+    const worker = new Worker(new URL('../workers/waveformWorker.ts', import.meta.url), {
+      type: 'module',
+    });
+
+    waveformWorkerRef.current = worker;
+    const resolverMap = waveformWorkerResolversRef.current;
+
+    const handleMessage = (event: MessageEvent<WaveformWorkerResponse>) => {
+      const { requestId } = event.data ?? {};
+      if (typeof requestId !== 'number') return;
+      const resolver = resolverMap.get(requestId);
+      if (resolver) {
+        resolver(event.data);
+        resolverMap.delete(requestId);
+      }
+    };
+
+    const handleError = (errorEvent: ErrorEvent) => {
+      console.error('[waveform] worker error', errorEvent);
+      resolverMap.forEach((resolver, requestId) => {
+        resolver({ type: 'error', requestId, message: 'worker-error' });
+      });
+      resolverMap.clear();
+      setShouldUseLiveWaveform(true);
+      waveformModeRef.current = 'live';
+    };
+
+    worker.addEventListener('message', handleMessage);
+    worker.addEventListener('error', handleError);
+
+    return () => {
+      worker.removeEventListener('message', handleMessage);
+      worker.removeEventListener('error', handleError);
+      worker.terminate();
+      resolverMap.clear();
+      waveformWorkerRef.current = null;
+    };
+  }, []);
 
   const {
     data: captions,
@@ -310,6 +364,10 @@ export default function VideoDetailPage() {
     const next = getCurrentTimeMs();
     setCurrentTimeMs(Number.isFinite(next) ? next : null);
   }, [getCurrentTimeMs]);
+
+  useEffect(() => {
+    currentTimeMsRef.current = currentTimeMs;
+  }, [currentTimeMs]);
 
   const cancelTimeTracking = useCallback(() => {
     const video = videoRef.current;
@@ -900,6 +958,12 @@ export default function VideoDetailPage() {
     trimRangeRef.current = trimRange;
   }, [trimRange]);
 
+  const effectiveDurationMs = useMemo(() => {
+    if (typeof durationMs === 'number') return durationMs;
+    if (typeof video?.durationMs === 'number') return video.durationMs;
+    return null;
+  }, [durationMs, video]);
+
   useEffect(() => {
     if (!isWebglReady) return undefined;
 
@@ -921,6 +985,279 @@ export default function VideoDetailPage() {
       window.removeEventListener('resize', handleResize);
     };
   }, [isWebglReady, renderWebglFrame]);
+
+  type WaveformWorkerPayload =
+    | Omit<Extract<WaveformWorkerRequest, { type: 'load-samples' }>, 'requestId'>
+    | Omit<Extract<WaveformWorkerRequest, { type: 'compute-peaks' }>, 'requestId'>;
+
+  const postWaveformWorkerMessage = useCallback(
+    (message: WaveformWorkerPayload, transfer: Transferable[] = []) => {
+      const worker = waveformWorkerRef.current;
+      if (!worker) return Promise.reject(new Error('waveform-worker-unavailable'));
+
+      const requestId = waveformRequestIdRef.current + 1;
+      waveformRequestIdRef.current = requestId;
+
+      return new Promise<WaveformWorkerResponse>((resolve, reject) => {
+        waveformWorkerResolversRef.current.set(requestId, (response) => {
+          if (response.type === 'error') {
+            reject(new Error(response.message));
+            return;
+          }
+
+          resolve(response);
+        });
+
+        worker.postMessage({ ...(message as WaveformWorkerRequest), requestId }, transfer);
+      });
+    },
+    [],
+  );
+
+  const resetWaveformOverview = useCallback(() => {
+    waveformSamplesReadyRef.current = false;
+    waveformOverviewPeaksRef.current = null;
+    waveformBucketCountRef.current = null;
+    waveformPendingBucketRef.current = null;
+    waveformLastComputeAtRef.current = 0;
+    waveformModeRef.current = 'loading';
+    if (waveformComputeTimeoutRef.current !== null) {
+      window.clearTimeout(waveformComputeTimeoutRef.current);
+      waveformComputeTimeoutRef.current = null;
+    }
+  }, []);
+
+  const getWaveformBucketCount = useCallback(() => {
+    const canvas = waveformCanvasRef.current;
+    if (!canvas) return null;
+    const dpr = window.devicePixelRatio || 1;
+    const width = Math.max(1, Math.round(canvas.clientWidth * dpr));
+    return Math.max(64, width);
+  }, []);
+
+  const renderOverviewWaveform = useCallback(() => {
+    const canvas = waveformCanvasRef.current;
+    const peaks = waveformOverviewPeaksRef.current;
+    const bucketCount = waveformBucketCountRef.current;
+    if (!canvas) return;
+
+    const context = canvas.getContext('2d');
+    if (!context) return;
+
+    const dpr = window.devicePixelRatio || 1;
+    const width = Math.max(1, Math.round(canvas.clientWidth * dpr));
+    const height = Math.max(1, Math.round(canvas.clientHeight * dpr));
+
+    if (canvas.width !== width || canvas.height !== height) {
+      canvas.width = width;
+      canvas.height = height;
+    }
+
+    context.clearRect(0, 0, width, height);
+    if (!peaks || !bucketCount) return;
+
+    const halfHeight = height / 2;
+    const barWidth = width / bucketCount;
+
+    context.lineWidth = Math.max(1, dpr);
+    context.strokeStyle = '#2b7bff';
+    context.beginPath();
+
+    for (let i = 0; i < bucketCount; i += 1) {
+      const min = (peaks[i * 2] ?? 0) / 32768;
+      const max = (peaks[i * 2 + 1] ?? 0) / 32767;
+      const x = i * barWidth;
+      const yMin = halfHeight + min * halfHeight;
+      const yMax = halfHeight + max * halfHeight;
+      context.moveTo(x, yMin);
+      context.lineTo(x, yMax);
+    }
+
+    context.stroke();
+
+    if (typeof currentTimeMsRef.current === 'number' && typeof effectiveDurationMs === 'number' && effectiveDurationMs > 0) {
+      const ratio = Math.min(1, Math.max(0, currentTimeMsRef.current / effectiveDurationMs));
+      const x = ratio * width;
+      context.strokeStyle = '#ef4444';
+      context.lineWidth = Math.max(1, dpr * 1.2);
+      context.beginPath();
+      context.moveTo(x, 0);
+      context.lineTo(x, height);
+      context.stroke();
+    }
+  }, [effectiveDurationMs]);
+
+  const computeOverviewPeaks = useCallback(
+    async (bucketCount: number) => {
+      try {
+        const token = waveformComputeTokenRef.current + 1;
+        waveformComputeTokenRef.current = token;
+        const response = await postWaveformWorkerMessage({ type: 'compute-peaks', bucketCount });
+        if (response.type !== 'peaks-ready') return;
+        if (token !== waveformComputeTokenRef.current) return;
+
+        waveformOverviewPeaksRef.current = new Int16Array(response.peaks);
+        waveformBucketCountRef.current = response.bucketCount;
+        waveformLastComputeAtRef.current = Date.now();
+        waveformPendingBucketRef.current = null;
+
+        if (import.meta.env.DEV) {
+          console.debug(
+            `[waveform] overview peaks computed in ${response.durationMs.toFixed(1)}ms via ${response.impl}`,
+          );
+        }
+
+        renderOverviewWaveform();
+      } catch (error) {
+        console.error('[waveform] peak computation failed', error);
+        setShouldUseLiveWaveform(true);
+        waveformModeRef.current = 'live';
+      }
+    },
+    [postWaveformWorkerMessage, renderOverviewWaveform],
+  );
+
+  const queueWaveformComputation = useCallback(
+    (bucketCount: number | null) => {
+      if (!bucketCount || bucketCount <= 0 || shouldUseLiveWaveform) return;
+
+      waveformPendingBucketRef.current = bucketCount;
+
+      if (waveformComputeTimeoutRef.current !== null) {
+        window.clearTimeout(waveformComputeTimeoutRef.current);
+      }
+
+      const now = Date.now();
+      if (waveformBucketCountRef.current === bucketCount && now - waveformLastComputeAtRef.current < 1000) {
+        renderOverviewWaveform();
+        return;
+      }
+
+      const delay = waveformLastComputeAtRef.current === 0
+        ? 0
+        : Math.max(0, 1000 - (now - waveformLastComputeAtRef.current));
+
+      waveformComputeTimeoutRef.current = window.setTimeout(() => {
+        waveformComputeTimeoutRef.current = null;
+        const pendingBucketCount = waveformPendingBucketRef.current;
+        if (!waveformSamplesReadyRef.current || typeof pendingBucketCount !== 'number') return;
+        void computeOverviewPeaks(pendingBucketCount);
+      }, delay);
+    },
+    [computeOverviewPeaks, renderOverviewWaveform, shouldUseLiveWaveform],
+  );
+
+  useEffect(() => {
+    resetWaveformOverview();
+    setShouldUseLiveWaveform(false);
+
+    if (!videoBlob) return undefined;
+
+    let cancelled = false;
+
+    const decodeWaveform = async () => {
+      const AudioContextClass =
+        window.AudioContext ?? (window as typeof window & { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
+      if (!AudioContextClass) {
+        setShouldUseLiveWaveform(true);
+        waveformModeRef.current = 'live';
+        return;
+      }
+
+      let context: AudioContext | null = null;
+
+      try {
+        context = new AudioContextClass();
+        waveformModeRef.current = 'loading';
+
+        const audioBuffer = await videoBlob.arrayBuffer();
+        const decoded = await context.decodeAudioData(audioBuffer.slice(0));
+        if (cancelled) return;
+
+        const firstChannel = decoded.getChannelData(0);
+        let samples: Float32Array;
+
+        if (decoded.numberOfChannels >= 2) {
+          // 기본은 첫 번째 채널, 2채널인 경우 좌/우 평균을 사용한다.
+          const secondChannel = decoded.getChannelData(1);
+          samples = new Float32Array(firstChannel.length);
+          for (let i = 0; i < samples.length; i += 1) {
+            const left = firstChannel[i] ?? 0;
+            const right = secondChannel[i] ?? 0;
+            samples[i] = (left + right) / 2;
+          }
+        } else {
+          samples = new Float32Array(firstChannel);
+        }
+
+        const response = await postWaveformWorkerMessage(
+          { type: 'load-samples', samples: samples.buffer as ArrayBuffer },
+          [samples.buffer],
+        );
+        if (cancelled) return;
+        if (response.type !== 'samples-loaded') throw new Error('waveform-load-failed');
+
+        waveformSamplesReadyRef.current = true;
+        waveformModeRef.current = 'overview';
+
+        const bucketCount = getWaveformBucketCount();
+        queueWaveformComputation(bucketCount ?? Math.min(samples.length, 4096));
+      } catch (error) {
+        if (cancelled) return;
+        if (import.meta.env.DEV) {
+          console.debug('[waveform] overview fallback', error);
+        }
+        waveformSamplesReadyRef.current = false;
+        waveformOverviewPeaksRef.current = null;
+        resetWaveformOverview();
+        setShouldUseLiveWaveform(true);
+        waveformModeRef.current = 'live';
+      } finally {
+        if (context) void context.close().catch(() => null);
+      }
+    };
+
+    void decodeWaveform();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [getWaveformBucketCount, postWaveformWorkerMessage, queueWaveformComputation, resetWaveformOverview, videoBlob]);
+
+  useEffect(() => {
+    if (shouldUseLiveWaveform) return undefined;
+
+    const canvas = waveformCanvasRef.current;
+    if (!canvas) return undefined;
+
+    const handleResize = () => {
+      const bucketCount = getWaveformBucketCount();
+      if (bucketCount && bucketCount !== waveformBucketCountRef.current) {
+        queueWaveformComputation(bucketCount);
+      }
+      renderOverviewWaveform();
+    };
+
+    const observer = typeof ResizeObserver !== 'undefined' ? new ResizeObserver(handleResize) : null;
+    if (observer) observer.observe(canvas);
+    window.addEventListener('resize', handleResize);
+
+    handleResize();
+
+    return () => {
+      observer?.disconnect();
+      window.removeEventListener('resize', handleResize);
+      if (waveformComputeTimeoutRef.current !== null) {
+        window.clearTimeout(waveformComputeTimeoutRef.current);
+        waveformComputeTimeoutRef.current = null;
+      }
+    };
+  }, [getWaveformBucketCount, queueWaveformComputation, renderOverviewWaveform, shouldUseLiveWaveform]);
+
+  useEffect(() => {
+    if (shouldUseLiveWaveform) return;
+    renderOverviewWaveform();
+  }, [renderOverviewWaveform, shouldUseLiveWaveform, currentTimeMs]);
 
   const drawWaveform = useCallback(() => {
     const canvas = waveformCanvasRef.current;
@@ -983,7 +1320,7 @@ export default function VideoDetailPage() {
 
   useEffect(() => {
     const videoElement = videoRef.current;
-    if (!videoElement || !videoUrl) return undefined;
+    if (!videoElement || !videoUrl || !shouldUseLiveWaveform) return undefined;
 
     const AudioContextClass =
       window.AudioContext ?? (window as typeof window & { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
@@ -1061,7 +1398,13 @@ export default function VideoDetailPage() {
       mediaSourceRef.current = null;
       waveformDataRef.current = null;
     };
-  }, [startWaveform, stopWaveform, videoUrl]);
+  }, [shouldUseLiveWaveform, startWaveform, stopWaveform, videoUrl]);
+
+  useEffect(() => {
+    if (!shouldUseLiveWaveform) {
+      stopWaveform();
+    }
+  }, [shouldUseLiveWaveform, stopWaveform]);
 
   useEffect(() => {
     if (!isWebglReady) return undefined;
@@ -1126,12 +1469,6 @@ export default function VideoDetailPage() {
 
     target.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
   }, [activeCaptionId]);
-
-  const effectiveDurationMs = useMemo(() => {
-    if (typeof durationMs === 'number') return durationMs;
-    if (typeof video?.durationMs === 'number') return video.durationMs;
-    return null;
-  }, [durationMs, video]);
 
   const selection = useMemo(() => {
     if (!trimRange || typeof effectiveDurationMs !== 'number') return null;

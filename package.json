@@ -10,6 +10,7 @@
     "test": "vitest run",
     "format": "prettier --write .",
     "format:check": "prettier --check .",
+    "wasm:build": "bash scripts/build-wasm.sh",
     "preview": "vite preview"
   },
   "dependencies": {
@@ -34,6 +35,7 @@
     "typescript": "~5.9.3",
     "typescript-eslint": "^8.46.4",
     "vite": "^7.2.4",
-    "vitest": "^2.1.4"
+    "vitest": "^2.1.4",
+    "wabt": "^1.0.39"
   }
 }
