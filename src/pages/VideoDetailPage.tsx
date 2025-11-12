@@ -8,6 +8,7 @@ import type { Caption, Video } from '@/datasource/types';
 import { getActiveCaptionAtMs } from '@/lib/captionActive';
 import { captionsToSrt, downloadTextFile, parseCaptionsFromJson, serializeCaptionsToJson } from '@/lib/captionIO';
 import { queryClient } from '@/lib/queryClient';
+import type { BurnInWorkerResponse } from '@/workers/burnInWorker';
 import type { WaveformWorkerRequest, WaveformWorkerResponse } from '@/workers/waveformWorker';
 
 import type { ChangeEvent, PointerEvent as ReactPointerEvent, SyntheticEvent } from 'react';
@@ -75,6 +76,21 @@ function formatTimestamp(ms: number) {
     .toString()
     .padStart(3, '0');
   return `${minutes}:${seconds}.${milliseconds}`;
+}
+
+function sanitizeForFileName(text: string, fallback: string) {
+  const safe = text.replace(/[^a-zA-Z0-9-_]+/g, '_').replace(/_+/g, '_').replace(/^_+|_+$/g, '');
+  return safe || fallback;
+}
+
+function formatNowForFileName(now = new Date()) {
+  const yyyy = now.getFullYear().toString();
+  const MM = (now.getMonth() + 1).toString().padStart(2, '0');
+  const dd = now.getDate().toString().padStart(2, '0');
+  const hh = now.getHours().toString().padStart(2, '0');
+  const mm = now.getMinutes().toString().padStart(2, '0');
+  const ss = now.getSeconds().toString().padStart(2, '0');
+  return `${yyyy}${MM}${dd}_${hh}${mm}${ss}`;
 }
 
 type WebglResources = {
@@ -187,6 +203,13 @@ export default function VideoDetailPage() {
   const [isWebglSupported, setIsWebglSupported] = useState(true);
   const [isWebglReady, setIsWebglReady] = useState(false);
   const [isGrayscale, setIsGrayscale] = useState(false);
+  const burnInWorkerRef = useRef<Worker | null>(null);
+  const [isBurningIn, setIsBurningIn] = useState(false);
+  const [burnInProgress, setBurnInProgress] = useState<number | null>(null);
+  const [burnInMessage, setBurnInMessage] = useState<string | null>(null);
+  const [burnInError, setBurnInError] = useState<string | null>(null);
+  const [burnInResultUrl, setBurnInResultUrl] = useState<string | null>(null);
+  const [burnInFileName, setBurnInFileName] = useState<string | null>(null);
 
   const {
     data: videoBlob,
@@ -244,6 +267,16 @@ export default function VideoDetailPage() {
       if (thumbnailUrl) URL.revokeObjectURL(thumbnailUrl);
     };
   }, [thumbnailUrl]);
+
+  useEffect(() => {
+    return () => {
+      if (burnInResultUrl) {
+        URL.revokeObjectURL(burnInResultUrl);
+      }
+      const worker = burnInWorkerRef.current;
+      if (worker) worker.terminate();
+    };
+  }, [burnInResultUrl]);
 
   useEffect(() => {
     const worker = new Worker(new URL('../workers/waveformWorker.ts', import.meta.url), {
@@ -730,10 +763,19 @@ export default function VideoDetailPage() {
 
   const baseFileName = useMemo(() => {
     if (!video) return 'captions';
-    const safeTitle = video.title.replace(/[^a-zA-Z0-9-_]+/g, '_').replace(/_+/g, '_');
-    const trimmed = safeTitle.replace(/^_+|_+$/g, '');
-    return trimmed || 'captions';
+    return sanitizeForFileName(video.title, 'captions');
   }, [video]);
+
+  const safeTitleOrId = useMemo(() => {
+    if (video?.title) return sanitizeForFileName(video.title, videoId || 'video');
+    if (videoId) return sanitizeForFileName(videoId, 'video');
+    return 'video';
+  }, [video, videoId]);
+
+  const burnInFontUrl = useMemo(() => {
+    if (typeof window === 'undefined') return '';
+    return new URL('/fonts/NotoSansKR-Regular.ttf', window.location.origin).toString();
+  }, []);
 
   const getCaptionsForExport = useCallback(() => {
     if (!applyTrimOnExport || !trimRange) return captionDrafts;
@@ -771,6 +813,136 @@ export default function VideoDetailPage() {
     const srt = captionsToSrt(captionsForExport);
     downloadTextFile(`${baseFileName}.srt`, srt, 'application/x-subrip;charset=utf-8');
   }, [baseFileName, getCaptionsForExport]);
+
+  const stopBurnInWorker = useCallback(() => {
+    const worker = burnInWorkerRef.current;
+    if (worker) {
+      worker.terminate();
+      burnInWorkerRef.current = null;
+    }
+  }, []);
+
+  const handleCancelBurnIn = useCallback(() => {
+    stopBurnInWorker();
+    setIsBurningIn(false);
+    setBurnInProgress(null);
+    setBurnInMessage('번인 내보내기를 취소했어요.');
+  }, [stopBurnInWorker]);
+
+  const handleBurnInExport = useCallback(async () => {
+    if (!videoBlob) {
+      setBurnInError('영상 파일을 찾지 못했어요. 다시 시도해 주세요.');
+      return;
+    }
+
+    if (!burnInFontUrl) {
+      setBurnInError('폰트 파일 경로를 준비하지 못했어요.');
+      return;
+    }
+
+    const mime = videoBlob.type || '';
+    if (!mime.includes('mp4')) {
+      setBurnInError('mp4 영상만 번인 내보내기를 지원해요.');
+      return;
+    }
+
+    if (videoBlob.size > 50 * 1024 * 1024) {
+      setBurnInError('50MB 이하의 mp4만 번인 내보내기를 지원해요.');
+      return;
+    }
+
+    if (typeof durationMs === 'number' && durationMs > 30_000) {
+      setBurnInError('길이 30초 이하의 영상을 사용해 주세요.');
+      return;
+    }
+
+    const captionsForExport = getCaptionsForExport();
+    const srt = captionsToSrt(captionsForExport);
+
+    stopBurnInWorker();
+    if (burnInResultUrl) {
+      URL.revokeObjectURL(burnInResultUrl);
+      setBurnInResultUrl(null);
+    }
+
+    setBurnInError(null);
+    setBurnInProgress(0);
+    setBurnInMessage('ffmpeg.wasm을 로드하는 중이에요…');
+    setIsBurningIn(true);
+
+    const worker = new Worker(new URL('../workers/burnInWorker.ts', import.meta.url), {
+      type: 'module',
+    });
+
+    burnInWorkerRef.current = worker;
+    const requestId = Date.now();
+
+    const fileName = `${safeTitleOrId}_burnin_${formatNowForFileName()}.mp4`;
+    setBurnInFileName(fileName);
+
+    function handleError(errorEvent: ErrorEvent) {
+      console.error('[burn-in-worker] crashed', errorEvent);
+      setBurnInError('번인 작업 중 오류가 발생했어요. 다시 시도해 주세요.');
+      setIsBurningIn(false);
+      worker.removeEventListener('message', handleMessage);
+      worker.removeEventListener('error', handleError);
+      stopBurnInWorker();
+    }
+
+    function handleMessage(event: MessageEvent<BurnInWorkerResponse>) {
+      const data = event.data;
+      if (!data || data.requestId !== requestId) return;
+
+      if (data.type === 'progress') {
+        if (typeof data.progress === 'number') setBurnInProgress(data.progress);
+        if (data.message) setBurnInMessage(data.message);
+        return;
+      }
+
+      if (data.type === 'done') {
+        const blob = new Blob([data.output], { type: 'video/mp4' });
+        const url = URL.createObjectURL(blob);
+        setBurnInResultUrl(url);
+        setBurnInMessage('자막이 포함된 mp4가 준비됐어요.');
+        setIsBurningIn(false);
+        worker.removeEventListener('message', handleMessage);
+        worker.removeEventListener('error', handleError);
+        stopBurnInWorker();
+
+        const link = document.createElement('a');
+        link.href = url;
+        link.download = fileName;
+        link.click();
+        return;
+      }
+
+      if (data.type === 'error') {
+        setBurnInError('번인 내보내기에 실패했어요. 잠시 후 다시 시도해 주세요.');
+        console.error('[burn-in-worker] error', data.message);
+        setIsBurningIn(false);
+        worker.removeEventListener('message', handleMessage);
+        worker.removeEventListener('error', handleError);
+        stopBurnInWorker();
+      }
+    }
+
+    worker.addEventListener('message', handleMessage);
+    worker.addEventListener('error', handleError);
+
+    const videoBuffer = await videoBlob.arrayBuffer();
+    worker.postMessage(
+      { type: 'burn-in', requestId, videoData: videoBuffer, srtText: srt, fontUrl: burnInFontUrl },
+      [videoBuffer],
+    );
+  }, [
+    burnInFontUrl,
+    burnInResultUrl,
+    durationMs,
+    getCaptionsForExport,
+    safeTitleOrId,
+    stopBurnInWorker,
+    videoBlob,
+  ]);
 
   const handleImportJsonClick = useCallback(() => {
     fileInputRef.current?.click();
@@ -2020,6 +2192,119 @@ export default function VideoDetailPage() {
               >
                 SRT 내보내기
               </button>
+            </div>
+
+            <div
+              style={{
+                marginTop: 12,
+                padding: 12,
+                border: '1px solid #e6e6e6',
+                borderRadius: 10,
+                background: '#fafafa',
+                display: 'flex',
+                flexDirection: 'column',
+                gap: 8,
+              }}
+            >
+              <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center' }}>
+                <button
+                  type="button"
+                  onClick={handleBurnInExport}
+                  disabled={
+                    isBurningIn ||
+                    isBlobLoading ||
+                    Boolean(videoBlobError) ||
+                    !videoBlob ||
+                    captionDrafts.length === 0
+                  }
+                  style={{
+                    padding: '10px 14px',
+                    borderRadius: 8,
+                    border: '1px solid #222',
+                    background: '#111',
+                    color: '#fff',
+                    cursor: isBurningIn ? 'not-allowed' : 'pointer',
+                  }}
+                >
+                  {isBurningIn ? '번인 내보내는 중…' : '자막 번인 mp4 내보내기'}
+                </button>
+                {isBurningIn ? (
+                  <button
+                    type="button"
+                    onClick={handleCancelBurnIn}
+                    style={{
+                      padding: '9px 12px',
+                      borderRadius: 8,
+                      border: '1px solid #b00020',
+                      background: '#fff6f6',
+                      color: '#b00020',
+                      cursor: 'pointer',
+                    }}
+                  >
+                    작업 취소
+                  </button>
+                ) : null}
+              </div>
+              <p style={{ margin: 0, color: '#555', fontSize: 13 }}>
+                지원: mp4 · 길이 30초 이하 또는 50MB 이하. 진행 중에도 다른 작업은 그대로 사용할 수 있어요.
+              </p>
+              {burnInProgress !== null || burnInMessage ? (
+                <div style={{ color: '#111', fontSize: 14, lineHeight: 1.4 }}>
+                  {burnInProgress !== null ? (
+                    <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
+                      <div
+                        style={{
+                          flex: '0 0 160px',
+                          height: 8,
+                          borderRadius: 999,
+                          background: '#e5e5e5',
+                          overflow: 'hidden',
+                        }}
+                      >
+                        <div
+                          style={{
+                            width: `${Math.round(Math.min(1, Math.max(0, burnInProgress)) * 100)}%`,
+                            height: '100%',
+                            background: '#4a90e2',
+                          }}
+                        />
+                      </div>
+                      <span style={{ color: '#333', fontSize: 13 }}>
+                        {Math.round(Math.min(1, Math.max(0, burnInProgress)) * 100)}%
+                      </span>
+                    </div>
+                  ) : null}
+                  {burnInMessage ? <div style={{ marginTop: 4, color: '#333' }}>{burnInMessage}</div> : null}
+                </div>
+              ) : null}
+              {burnInResultUrl && burnInFileName ? (
+                <div style={{ fontSize: 14 }}>
+                  <a
+                    href={burnInResultUrl}
+                    download={burnInFileName}
+                    style={{ color: '#0b74de', textDecoration: 'underline' }}
+                  >
+                    번인된 mp4 다시 저장하기
+                  </a>
+                </div>
+              ) : null}
+              {burnInError ? (
+                <div
+                  style={{
+                    padding: 10,
+                    borderRadius: 8,
+                    border: '1px solid #f2c4c4',
+                    background: '#fff6f6',
+                    color: '#b00020',
+                    fontSize: 14,
+                  }}
+                >
+                  <p style={{ margin: '0 0 4px' }}>{burnInError}</p>
+                  <p style={{ margin: 0, color: '#b00020', fontSize: 12 }}>
+                    DEV 로그는 콘솔을 확인하세요.
+                  </p>
+                </div>
+              ) : null}
             </div>
 
             {importError ? (
