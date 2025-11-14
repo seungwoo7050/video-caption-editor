@@ -8,7 +8,9 @@ import type { Caption, Video } from '@/datasource/types';
 import { getActiveCaptionAtMs } from '@/lib/captionActive';
 import { captionsToSrt, downloadTextFile, parseCaptionsFromJson, serializeCaptionsToJson } from '@/lib/captionIO';
 import { queryClient } from '@/lib/queryClient';
+import { normalizeTrimRange } from '@/lib/trimRange';
 import type { BurnInWorkerResponse } from '@/workers/burnInWorker';
+import type { TrimWorkerResponse } from '@/workers/trimWorker';
 import type { WaveformWorkerRequest, WaveformWorkerResponse } from '@/workers/waveformWorker';
 
 import type { ChangeEvent, PointerEvent as ReactPointerEvent, SyntheticEvent } from 'react';
@@ -210,6 +212,13 @@ export default function VideoDetailPage() {
   const [burnInError, setBurnInError] = useState<string | null>(null);
   const [burnInResultUrl, setBurnInResultUrl] = useState<string | null>(null);
   const [burnInFileName, setBurnInFileName] = useState<string | null>(null);
+  const trimWorkerRef = useRef<Worker | null>(null);
+  const [isTrimming, setIsTrimming] = useState(false);
+  const [trimProgress, setTrimProgress] = useState<number | null>(null);
+  const [trimMessage, setTrimMessage] = useState<string | null>(null);
+  const [trimError, setTrimError] = useState<string | null>(null);
+  const [trimResultUrl, setTrimResultUrl] = useState<string | null>(null);
+  const [trimFileName, setTrimFileName] = useState<string | null>(null);
 
   const {
     data: videoBlob,
@@ -822,6 +831,14 @@ export default function VideoDetailPage() {
     }
   }, []);
 
+  const stopTrimWorker = useCallback(() => {
+    const worker = trimWorkerRef.current;
+    if (worker) {
+      worker.terminate();
+      trimWorkerRef.current = null;
+    }
+  }, []);
+
   const handleCancelBurnIn = useCallback(() => {
     stopBurnInWorker();
     setIsBurningIn(false);
@@ -856,8 +873,7 @@ export default function VideoDetailPage() {
       return;
     }
 
-    const captionsForExport = getCaptionsForExport();
-    const srt = captionsToSrt(captionsForExport);
+    const srt = captionsToSrt(captionDrafts);
 
     stopBurnInWorker();
     if (burnInResultUrl) {
@@ -938,7 +954,7 @@ export default function VideoDetailPage() {
     burnInFontUrl,
     burnInResultUrl,
     durationMs,
-    getCaptionsForExport,
+    captionDrafts,
     safeTitleOrId,
     stopBurnInWorker,
     videoBlob,
@@ -1136,6 +1152,160 @@ export default function VideoDetailPage() {
     return null;
   }, [durationMs, video]);
 
+  const normalizedTrimRange = useMemo(() => {
+    return normalizeTrimRange(trimRange, effectiveDurationMs);
+  }, [effectiveDurationMs, trimRange]);
+
+  const trimRangeSummary = useMemo(() => {
+    if (!normalizedTrimRange) return null;
+    const durationSeconds = (
+      (normalizedTrimRange.trimEnd - normalizedTrimRange.trimStart) /
+      1000
+    ).toFixed(2);
+    const startMs = Math.round(normalizedTrimRange.trimStart);
+    const endMs = Math.round(normalizedTrimRange.trimEnd);
+    return { durationSeconds, startMs, endMs };
+  }, [normalizedTrimRange]);
+
+  const handleTrimExport = useCallback(async () => {
+    if (!applyTrimOnExport) return;
+
+    if (!trimRange) {
+      setTrimError('트림 구간을 먼저 선택해 주세요.');
+      return;
+    }
+
+    if (!videoBlob) {
+      setTrimError('영상 파일을 찾지 못했어요. 다시 시도해 주세요.');
+      return;
+    }
+
+    const mime = videoBlob.type || '';
+    if (!mime.includes('mp4')) {
+      setTrimError('mp4 영상만 구간 내보내기를 지원해요.');
+      return;
+    }
+
+    if (videoBlob.size > 50 * 1024 * 1024) {
+      setTrimError('50MB 이하의 mp4만 구간 내보내기를 지원해요.');
+      return;
+    }
+
+    if (typeof effectiveDurationMs !== 'number') {
+      setTrimError('영상 길이를 확인한 뒤 다시 시도해 주세요.');
+      return;
+    }
+
+    if (effectiveDurationMs > 30_000) {
+      setTrimError('길이 30초 이하의 영상을 사용해 주세요.');
+      return;
+    }
+
+    if (!normalizedTrimRange) {
+      setTrimError('유효한 트림 구간을 선택해 주세요.');
+      return;
+    }
+
+    const { trimStart, trimEnd } = normalizedTrimRange;
+
+    stopTrimWorker();
+    if (trimResultUrl) {
+      URL.revokeObjectURL(trimResultUrl);
+      setTrimResultUrl(null);
+    }
+
+    setTrimError(null);
+    setTrimProgress(0);
+    setTrimMessage('ffmpeg.wasm을 로드하는 중이에요…');
+    setIsTrimming(true);
+
+    const worker = new Worker(new URL('../workers/trimWorker.ts', import.meta.url), {
+      type: 'module',
+    });
+
+    trimWorkerRef.current = worker;
+    const requestId = Date.now();
+    const fileName = `${safeTitleOrId}_trim_${Math.round(trimStart)}-${Math.round(trimEnd)}_${formatNowForFileName()}.mp4`;
+    setTrimFileName(fileName);
+
+    function cleanup() {
+      worker.removeEventListener('message', handleMessage);
+      worker.removeEventListener('error', handleError);
+      stopTrimWorker();
+    }
+
+    function handleError(errorEvent: ErrorEvent) {
+      console.error('[trim-worker] crashed', errorEvent);
+      setTrimError('구간 내보내기 중 오류가 발생했어요. 다시 시도해 주세요.');
+      setIsTrimming(false);
+      cleanup();
+    }
+
+    function handleMessage(event: MessageEvent<TrimWorkerResponse>) {
+      const data = event.data;
+      if (!data || data.requestId !== requestId) return;
+
+      if (data.type === 'progress') {
+        if (typeof data.progress === 'number') setTrimProgress(data.progress);
+        if (data.message) setTrimMessage(data.message);
+        return;
+      }
+
+      if (data.type === 'done') {
+        const blob = new Blob([data.output], { type: 'video/mp4' });
+        const url = URL.createObjectURL(blob);
+        setTrimResultUrl(url);
+        setTrimMessage('트림된 mp4가 준비됐어요.');
+        setIsTrimming(false);
+        cleanup();
+
+        const link = document.createElement('a');
+        link.href = url;
+        link.download = fileName;
+        link.click();
+        return;
+      }
+
+      if (data.type === 'error') {
+        setTrimError('구간 mp4 내보내기에 실패했어요. 잠시 후 다시 시도해 주세요.');
+        console.error('[trim-worker] error', data.message);
+        setIsTrimming(false);
+        cleanup();
+      }
+    }
+
+    worker.addEventListener('message', handleMessage);
+    worker.addEventListener('error', handleError);
+
+    try {
+      const videoBuffer = await videoBlob.arrayBuffer();
+      worker.postMessage(
+        { type: 'trim', requestId, videoData: videoBuffer, startMs: trimStart, endMs: trimEnd },
+        [videoBuffer],
+      );
+    } catch (error) {
+      setTrimError(error instanceof Error ? error.message : '구간 mp4 내보내기에 실패했어요.');
+      setIsTrimming(false);
+      cleanup();
+    }
+  }, [
+    applyTrimOnExport,
+    effectiveDurationMs,
+    normalizedTrimRange,
+    safeTitleOrId,
+    stopTrimWorker,
+    trimRange,
+    trimResultUrl,
+    videoBlob,
+  ]);
+
+  const handleCancelTrim = useCallback(() => {
+    stopTrimWorker();
+    setIsTrimming(false);
+    setTrimProgress(null);
+    setTrimMessage('구간 mp4 내보내기를 취소했어요.');
+  }, [stopTrimWorker]);
+
   useEffect(() => {
     if (!isWebglReady) return undefined;
 
@@ -1157,6 +1327,24 @@ export default function VideoDetailPage() {
       window.removeEventListener('resize', handleResize);
     };
   }, [isWebglReady, renderWebglFrame]);
+
+  useEffect(() => {
+    return () => {
+      stopTrimWorker();
+    };
+  }, [stopTrimWorker]);
+
+  useEffect(() => {
+    return () => {
+      if (trimResultUrl) {
+        try {
+          URL.revokeObjectURL(trimResultUrl);
+        } catch {
+          // ignore
+        }
+      }
+    };
+  }, [trimResultUrl]);
 
   type WaveformWorkerPayload =
     | Omit<Extract<WaveformWorkerRequest, { type: 'load-samples' }>, 'requestId'>
@@ -2194,6 +2382,122 @@ export default function VideoDetailPage() {
               </button>
             </div>
 
+            {applyTrimOnExport ? (
+              <div
+                style={{
+                  marginTop: 12,
+                  padding: 12,
+                  border: '1px solid #e6e6e6',
+                  borderRadius: 10,
+                  background: '#fafafa',
+                  display: 'flex',
+                  flexDirection: 'column',
+                  gap: 8,
+                }}
+              >
+                <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center' }}>
+                  <button
+                    type="button"
+                    onClick={handleTrimExport}
+                    disabled={
+                      isTrimming ||
+                      isBlobLoading ||
+                      Boolean(videoBlobError) ||
+                      !videoBlob ||
+                      !normalizedTrimRange
+                    }
+                    style={{
+                      padding: '10px 14px',
+                      borderRadius: 8,
+                      border: '1px solid #222',
+                      background: '#111',
+                      color: '#fff',
+                      cursor: isTrimming ? 'not-allowed' : 'pointer',
+                    }}
+                  >
+                    {isTrimming ? '구간 내보내는 중…' : '구간 mp4 내보내기'}
+                  </button>
+                  {isTrimming ? (
+                    <button
+                      type="button"
+                      onClick={handleCancelTrim}
+                      style={{
+                        padding: '9px 12px',
+                        borderRadius: 8,
+                        border: '1px solid #b00020',
+                        background: '#fff6f6',
+                        color: '#b00020',
+                        cursor: 'pointer',
+                      }}
+                    >
+                      작업 취소
+                    </button>
+                  ) : null}
+                </div>
+                <p style={{ margin: 0, color: '#555', fontSize: 13 }}>
+                  선택한 구간만 mp4로 잘라내요. 지원: mp4 · 길이 30초 이하 또는 50MB 이하.{' '}
+                  {trimRangeSummary
+                    ? `선택 범위 ${trimRangeSummary.durationSeconds}s (${trimRangeSummary.startMs}~${trimRangeSummary.endMs}ms).`
+                    : '유효한 트림 구간을 선택해 주세요.'}
+                </p>
+                {trimProgress !== null || trimMessage ? (
+                  <div style={{ color: '#111', fontSize: 14, lineHeight: 1.4 }}>
+                    {trimProgress !== null ? (
+                      <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
+                        <div
+                          style={{
+                            flex: '0 0 160px',
+                            height: 8,
+                            borderRadius: 999,
+                            background: '#e5e5e5',
+                            overflow: 'hidden',
+                          }}
+                        >
+                          <div
+                            style={{
+                              width: `${Math.round(Math.min(1, Math.max(0, trimProgress)) * 100)}%`,
+                              height: '100%',
+                              background: '#4a90e2',
+                            }}
+                          />
+                        </div>
+                        <span style={{ color: '#333', fontSize: 13 }}>
+                          {Math.round(Math.min(1, Math.max(0, trimProgress)) * 100)}%
+                        </span>
+                      </div>
+                    ) : null}
+                    {trimMessage ? <div style={{ marginTop: 4, color: '#333' }}>{trimMessage}</div> : null}
+                  </div>
+                ) : null}
+                {trimResultUrl && trimFileName ? (
+                  <div style={{ fontSize: 14 }}>
+                    <a
+                      href={trimResultUrl}
+                      download={trimFileName}
+                      style={{ color: '#0b74de', textDecoration: 'underline' }}
+                    >
+                      트림된 mp4 다시 저장하기
+                    </a>
+                  </div>
+                ) : null}
+                {trimError ? (
+                  <div
+                    style={{
+                      padding: 10,
+                      borderRadius: 8,
+                      border: '1px solid #f2c4c4',
+                      background: '#fff6f6',
+                      color: '#b00020',
+                      fontSize: 14,
+                    }}
+                  >
+                    <p style={{ margin: '0 0 4px' }}>{trimError}</p>
+                    <p style={{ margin: 0, color: '#b00020', fontSize: 12 }}>DEV 로그는 콘솔을 확인하세요.</p>
+                  </div>
+                ) : null}
+              </div>
+            ) : null}
+
             <div
               style={{
                 marginTop: 12,
@@ -2405,7 +2709,7 @@ export default function VideoDetailPage() {
                     </div>
                   ) : null}
                 </div>
-                {isWebglSupported && isWebglReady ? (
+                {isWebglSupported ? (
                   <div
                     style={{
                       marginTop: 12,
@@ -2418,11 +2722,14 @@ export default function VideoDetailPage() {
                     }}
                   >
                     <div style={{ display: 'flex', alignItems: 'center', gap: 8, justifyContent: 'space-between' }}>
-                      <p style={{ margin: 0, fontWeight: 600, color: '#111' }}>추가 미리보기 (WebGL)</p>
+                      <p style={{ margin: 0, fontWeight: 600, color: '#111' }}>
+                        추가 미리보기 (WebGL){!isWebglReady ? ' · 초기화 중…' : null}
+                      </p>
                       <label style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 14, color: '#111' }}>
                         <input
                           type="checkbox"
                           checked={isGrayscale}
+                          disabled={!isWebglReady}
                           onChange={(event) => setIsGrayscale(event.target.checked)}
                         />
                         <span>그레이스케일</span>
