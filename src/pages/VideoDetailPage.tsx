@@ -13,7 +13,12 @@ import type { BurnInWorkerResponse } from '@/workers/burnInWorker';
 import type { TrimWorkerResponse } from '@/workers/trimWorker';
 import type { WaveformWorkerRequest, WaveformWorkerResponse } from '@/workers/waveformWorker';
 
-import type { ChangeEvent, PointerEvent as ReactPointerEvent, SyntheticEvent } from 'react';
+import type {
+  ChangeEvent,
+  FocusEvent as ReactFocusEvent,
+  PointerEvent as ReactPointerEvent,
+  SyntheticEvent,
+} from 'react';
 
 import './VideoDetailPage.css';
 
@@ -67,17 +72,16 @@ function snapToStep(ms: number, stepMs: number) {
   return Math.round(ms / stepMs) * stepMs;
 }
 
-function formatTimestamp(ms: number) {
-  if (!Number.isFinite(ms)) return '--:--.---';
-  const totalSeconds = Math.max(0, Math.floor(ms / 1000));
-  const minutes = Math.floor(totalSeconds / 60)
-    .toString()
-    .padStart(2, '0');
-  const seconds = (totalSeconds % 60).toString().padStart(2, '0');
-  const milliseconds = Math.abs(ms % 1000)
-    .toString()
-    .padStart(3, '0');
-  return `${minutes}:${seconds}.${milliseconds}`;
+function formatSeconds(valueMs: number) {
+  if (!Number.isFinite(valueMs)) return '';
+  return (Math.max(0, valueMs) / 1000).toFixed(2);
+}
+
+function formatMsWithSeconds(valueMs: number) {
+  if (!Number.isFinite(valueMs)) return '--';
+  const clamped = Math.max(0, Math.round(valueMs));
+  const seconds = (clamped / 1000).toFixed(2);
+  return `${clamped}ms (${seconds}s)`;
 }
 
 function sanitizeForFileName(text: string, fallback: string) {
@@ -144,6 +148,11 @@ export default function VideoDetailPage() {
   const [trimRange, setTrimRange] = useState<{ startMs: number; endMs: number } | null>(null);
   const [applyTrimOnExport, setApplyTrimOnExport] = useState(false);
   const [snapStepMs, setSnapStepMs] = useState<100 | 1000>(100);
+  const [trimInputSeconds, setTrimInputSeconds] = useState<{ start: string; end: string }>({
+    start: '',
+    end: '',
+  });
+  const trimInputFocusRef = useRef<'start' | 'end' | null>(null);
   const timelineRef = useRef<HTMLDivElement | null>(null);
   const trimRangeRef = useRef<{ startMs: number; endMs: number } | null>(null);
   const [dragTarget, setDragTarget] = useState<'start' | 'end' | 'new' | null>(null);
@@ -1156,6 +1165,25 @@ export default function VideoDetailPage() {
     return normalizeTrimRange(trimRange, effectiveDurationMs);
   }, [effectiveDurationMs, trimRange]);
 
+  useEffect(() => {
+    if (!normalizedTrimRange) {
+      setTrimInputSeconds({ start: '', end: '' });
+      return;
+    }
+    setTrimInputSeconds((prev) => {
+      const nextStart =
+        trimInputFocusRef.current === 'start'
+          ? prev.start
+          : formatSeconds(normalizedTrimRange.trimStart);
+      const nextEnd =
+        trimInputFocusRef.current === 'end'
+          ? prev.end
+          : formatSeconds(normalizedTrimRange.trimEnd);
+      if (prev.start === nextStart && prev.end === nextEnd) return prev;
+      return { start: nextStart, end: nextEnd };
+    });
+  }, [normalizedTrimRange]);
+
   const trimRangeSummary = useMemo(() => {
     if (!normalizedTrimRange) return null;
     const durationSeconds = (
@@ -1164,7 +1192,9 @@ export default function VideoDetailPage() {
     ).toFixed(2);
     const startMs = Math.round(normalizedTrimRange.trimStart);
     const endMs = Math.round(normalizedTrimRange.trimEnd);
-    return { durationSeconds, startMs, endMs };
+    const startSeconds = formatSeconds(normalizedTrimRange.trimStart);
+    const endSeconds = formatSeconds(normalizedTrimRange.trimEnd);
+    return { durationSeconds, startMs, endMs, startSeconds, endSeconds };
   }, [normalizedTrimRange]);
 
   const handleTrimExport = useCallback(async () => {
@@ -1927,6 +1957,54 @@ export default function VideoDetailPage() {
     setDragTarget(null);
     updateTrimRange(latest);
   }, [dragTarget, updateTrimRange]);
+
+  const handleTrimSecondsChange = useCallback((field: 'start' | 'end', value: string) => {
+    setTrimInputSeconds((prev) => ({ ...prev, [field]: value }));
+  }, []);
+
+  const handleTrimSecondsFocus = useCallback(
+    (field: 'start' | 'end') => () => {
+      trimInputFocusRef.current = field;
+    },
+    [],
+  );
+
+  const handleTrimSecondsBlur = useCallback(
+    (field: 'start' | 'end') => (event: ReactFocusEvent<HTMLInputElement>) => {
+      trimInputFocusRef.current = null;
+      const raw = event.currentTarget.value;
+      const value = raw.replace(',', '.');
+      setTrimInputSeconds((prev) => ({ ...prev, [field]: value }));
+
+      const parsedSeconds = Number.parseFloat(value);
+      const currentRange = trimRangeRef.current ?? trimRange;
+      if (!currentRange || !Number.isFinite(parsedSeconds)) {
+        setTrimInputSeconds({
+          start: trimRangeSummary?.startSeconds ?? '',
+          end: trimRangeSummary?.endSeconds ?? '',
+        });
+        return;
+      }
+
+      const normalizedSeconds = Math.max(0, Math.round(parsedSeconds * 100) / 100);
+      const targetMs = Math.round(normalizedSeconds * 1000);
+      const nextRange =
+        field === 'start'
+          ? { startMs: targetMs, endMs: currentRange.endMs }
+          : { startMs: currentRange.startMs, endMs: targetMs };
+
+      updateTrimRange(nextRange);
+
+      const normalized = normalizeTrimRange(nextRange, effectiveDurationMs);
+      if (normalized) {
+        setTrimInputSeconds({
+          start: formatSeconds(normalized.trimStart),
+          end: formatSeconds(normalized.trimEnd),
+        });
+      }
+    },
+    [effectiveDurationMs, trimRange, trimRangeSummary?.endSeconds, trimRangeSummary?.startSeconds, updateTrimRange],
+  );
   useEffect(() => {
     if (!dragTarget) return undefined;
     window.addEventListener('pointermove', handlePointerMove);
@@ -2437,7 +2515,7 @@ export default function VideoDetailPage() {
                 <p style={{ margin: 0, color: '#555', fontSize: 13 }}>
                   선택한 구간만 mp4로 잘라내요. 지원: mp4 · 길이 30초 이하 또는 50MB 이하.{' '}
                   {trimRangeSummary
-                    ? `선택 범위 ${trimRangeSummary.durationSeconds}s (${trimRangeSummary.startMs}~${trimRangeSummary.endMs}ms).`
+                    ? `선택 범위 ${trimRangeSummary.durationSeconds}s (${formatMsWithSeconds(trimRangeSummary.startMs)} ~ ${formatMsWithSeconds(trimRangeSummary.endMs)}).`
                     : '유효한 트림 구간을 선택해 주세요.'}
                 </p>
                 {trimProgress !== null || trimMessage ? (
@@ -2773,16 +2851,48 @@ export default function VideoDetailPage() {
                     }}
                   >
                     <p style={{ margin: 0, color: '#111', fontWeight: 600 }}>트리밍 구간</p>
-                    <div style={{ display: 'flex', gap: 12, flexWrap: 'wrap', fontSize: 13 }}>
-                      <span style={{ color: '#111' }}>
-                        시작: <strong>{selection ? formatTimestamp(selection.startMs) : '--:--.---'}</strong>
-                      </span>
-                      <span style={{ color: '#111' }}>
-                        종료: <strong>{selection ? formatTimestamp(selection.endMs) : '--:--.---'}</strong>
-                      </span>
-                      <span style={{ color: '#555' }}>
-                        길이: {selection ? formatTimestamp(selection.durationMs) : '--:--.---'}
-                      </span>
+                    <div
+                      style={{
+                        display: 'grid',
+                        gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))',
+                        gap: 8,
+                        fontSize: 13,
+                        flex: 1,
+                      }}
+                    >
+                      <div
+                        style={{
+                          color: '#111',
+                          whiteSpace: 'nowrap',
+                          overflow: 'hidden',
+                          textOverflow: 'ellipsis',
+                          fontVariantNumeric: 'tabular-nums',
+                        }}
+                      >
+                        시작: <strong>{selection ? formatMsWithSeconds(selection.startMs) : '--'}</strong>
+                      </div>
+                      <div
+                        style={{
+                          color: '#111',
+                          whiteSpace: 'nowrap',
+                          overflow: 'hidden',
+                          textOverflow: 'ellipsis',
+                          fontVariantNumeric: 'tabular-nums',
+                        }}
+                      >
+                        종료: <strong>{selection ? formatMsWithSeconds(selection.endMs) : '--'}</strong>
+                      </div>
+                      <div
+                        style={{
+                          color: '#555',
+                          whiteSpace: 'nowrap',
+                          overflow: 'hidden',
+                          textOverflow: 'ellipsis',
+                          fontVariantNumeric: 'tabular-nums',
+                        }}
+                      >
+                        길이: {selection ? formatMsWithSeconds(selection.durationMs) : '--'}
+                      </div>
                     </div>
                   </div>
                   <div
@@ -2797,11 +2907,11 @@ export default function VideoDetailPage() {
                       touchAction: 'none',
                       overflow: 'hidden',
                     }}
-                    aria-label="트리밍 구간 선택"
-                  >
-                    {selection ? (
-                      <div
-                        style={{
+                      aria-label="트리밍 구간 선택"
+                    >
+                      {selection ? (
+                        <div
+                          style={{
                           position: 'absolute',
                           left: `${selection.leftPct}%`,
                           width: `${selection.widthPct}%`,
@@ -2852,7 +2962,53 @@ export default function VideoDetailPage() {
                           }}
                         />
                       </div>
-                    ) : null}
+                      ) : null}
+                  </div>
+                  <div
+                    style={{
+                      display: 'grid',
+                      gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))',
+                      gap: 12,
+                    }}
+                  >
+                    <label style={{ display: 'grid', gap: 4 }}>
+                      <span style={{ fontSize: 12, color: '#555' }}>시작 (초)</span>
+                      <input
+                        type="number"
+                        inputMode="decimal"
+                        min={0}
+                        step={0.01}
+                        value={trimInputSeconds.start}
+                        onFocus={handleTrimSecondsFocus('start')}
+                        onChange={(event) => handleTrimSecondsChange('start', event.target.value)}
+                        onBlur={handleTrimSecondsBlur('start')}
+                        style={{
+                          padding: '8px 10px',
+                          borderRadius: 6,
+                          border: '1px solid #cbd5e1',
+                          fontVariantNumeric: 'tabular-nums',
+                        }}
+                      />
+                    </label>
+                    <label style={{ display: 'grid', gap: 4 }}>
+                      <span style={{ fontSize: 12, color: '#555' }}>종료 (초)</span>
+                      <input
+                        type="number"
+                        inputMode="decimal"
+                        min={0}
+                        step={0.01}
+                        value={trimInputSeconds.end}
+                        onFocus={handleTrimSecondsFocus('end')}
+                        onChange={(event) => handleTrimSecondsChange('end', event.target.value)}
+                        onBlur={handleTrimSecondsBlur('end')}
+                        style={{
+                          padding: '8px 10px',
+                          borderRadius: 6,
+                          border: '1px solid #cbd5e1',
+                          fontVariantNumeric: 'tabular-nums',
+                        }}
+                      />
+                    </label>
                   </div>
                   <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center' }}>
                     <span style={{ fontSize: 13, color: '#333' }}>스냅:</span>
