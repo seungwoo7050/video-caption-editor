@@ -77,6 +77,8 @@ function formatSeconds(valueMs: number) {
   return (Math.max(0, valueMs) / 1000).toFixed(2);
 }
 
+const TRIM_LOOP_EPSILON_MS = 60;
+
 function formatMsWithSeconds(valueMs: number) {
   if (!Number.isFinite(valueMs)) return '--';
   const clamped = Math.max(0, Math.round(valueMs));
@@ -146,6 +148,7 @@ export default function VideoDetailPage() {
   const [importError, setImportError] = useState<string | null>(null);
   const [durationMs, setDurationMs] = useState<number | null>(null);
   const [trimRange, setTrimRange] = useState<{ startMs: number; endMs: number } | null>(null);
+  const [shouldLoopTrim, setShouldLoopTrim] = useState(false);
   const [applyTrimOnExport, setApplyTrimOnExport] = useState(false);
   const [snapStepMs, setSnapStepMs] = useState<100 | 1000>(100);
   const [trimInputSeconds, setTrimInputSeconds] = useState<{ start: string; end: string }>({
@@ -201,6 +204,8 @@ export default function VideoDetailPage() {
   const waveformLastComputeAtRef = useRef<number>(0);
   const waveformModeRef = useRef<'overview' | 'live' | 'loading'>('loading');
   const currentTimeMsRef = useRef<number | null>(null);
+  const shouldLoopTrimRef = useRef(false);
+  const normalizedTrimRangeRef = useRef<ReturnType<typeof normalizeTrimRange>>(null);
   const captionRefs = useRef<Record<string, HTMLLIElement | null>>({});
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const [currentTimeMs, setCurrentTimeMs] = useState<number | null>(null);
@@ -411,14 +416,66 @@ export default function VideoDetailPage() {
     return currentTimeMs;
   }, []);
 
-  const updateCurrentTime = useCallback(() => {
-    const next = getCurrentTimeMs();
-    setCurrentTimeMs(Number.isFinite(next) ? next : null);
-  }, [getCurrentTimeMs]);
+  const applyTrimLoopIfNeeded = useCallback(
+    (video: HTMLVideoElement, currentTimeMs: number) => {
+      if (!shouldLoopTrimRef.current) return currentTimeMs;
+      const range = normalizedTrimRangeRef.current;
+      if (!range || !Number.isFinite(currentTimeMs)) return currentTimeMs;
+      if (video.paused || video.ended) return currentTimeMs;
+      const { trimStart, trimEnd } = range;
+      if (trimEnd - trimStart <= 0) return currentTimeMs;
+
+      if (currentTimeMs > trimEnd - TRIM_LOOP_EPSILON_MS) {
+        video.currentTime = trimStart / 1000;
+        return Math.round(trimStart);
+      }
+
+      return currentTimeMs;
+    },
+    [],
+  );
+
+  const updateCurrentTime = useCallback(
+    (options: { enforceTrimLoop?: boolean } = {}) => {
+      const video = videoRef.current;
+      if (!video) {
+        setCurrentTimeMs(null);
+        return;
+      }
+
+      const next = getCurrentTimeMs();
+      const adjusted = options.enforceTrimLoop
+        ? applyTrimLoopIfNeeded(video, next)
+        : next;
+
+      setCurrentTimeMs(Number.isFinite(adjusted) ? adjusted : null);
+    },
+    [applyTrimLoopIfNeeded, getCurrentTimeMs],
+  );
 
   useEffect(() => {
     currentTimeMsRef.current = currentTimeMs;
   }, [currentTimeMs]);
+
+  const clampPlaybackToTrimOnPlay = useCallback(() => {
+    if (!shouldLoopTrimRef.current) return;
+    const video = videoRef.current;
+    const range = normalizedTrimRangeRef.current;
+    if (!video || !range) return;
+
+    const currentTimeMs = Number.isFinite(video.currentTime)
+      ? Math.round(video.currentTime * 1000)
+      : Number.NaN;
+    if (!Number.isFinite(currentTimeMs)) return;
+
+    if (
+      currentTimeMs < range.trimStart - TRIM_LOOP_EPSILON_MS ||
+      currentTimeMs > range.trimEnd + TRIM_LOOP_EPSILON_MS
+    ) {
+      video.currentTime = range.trimStart / 1000;
+      setCurrentTimeMs(Math.round(range.trimStart));
+    }
+  }, []);
 
   const cancelTimeTracking = useCallback(() => {
     const video = videoRef.current;
@@ -452,7 +509,7 @@ export default function VideoDetailPage() {
 
     if (typeof video.requestVideoFrameCallback === 'function') {
       const tick: VideoFrameRequestCallback = () => {
-        updateCurrentTime();
+        updateCurrentTime({ enforceTrimLoop: true });
         videoFrameRequestIdRef.current = video.requestVideoFrameCallback(tick);
       };
 
@@ -463,7 +520,7 @@ export default function VideoDetailPage() {
     if (video.paused || video.ended) return;
 
     const loop = () => {
-      updateCurrentTime();
+      updateCurrentTime({ enforceTrimLoop: true });
       if (!video.paused && !video.ended) {
         animationFrameIdRef.current = window.requestAnimationFrame(loop);
       } else {
@@ -1164,6 +1221,14 @@ export default function VideoDetailPage() {
   const normalizedTrimRange = useMemo(() => {
     return normalizeTrimRange(trimRange, effectiveDurationMs);
   }, [effectiveDurationMs, trimRange]);
+
+  useEffect(() => {
+    shouldLoopTrimRef.current = shouldLoopTrim;
+  }, [shouldLoopTrim]);
+
+  useEffect(() => {
+    normalizedTrimRangeRef.current = normalizedTrimRange;
+  }, [normalizedTrimRange]);
 
   useEffect(() => {
     if (!normalizedTrimRange) {
@@ -2021,29 +2086,29 @@ export default function VideoDetailPage() {
     const video = videoRef.current;
     if (!video) return undefined;
 
-    updateCurrentTime();
+    updateCurrentTime({ enforceTrimLoop: true });
 
-    const handleTimeUpdate = () => updateCurrentTime();
-    const handleSeeked = () => updateCurrentTime();
-    const handleSeeking = () => updateCurrentTime();
-    const handleLoadedMetadata = () => updateCurrentTime();
+    const handleTimeUpdate = () => updateCurrentTime({ enforceTrimLoop: true });
+    const handleSeeked = () => updateCurrentTime({ enforceTrimLoop: true });
+    const handleSeeking = () => updateCurrentTime({ enforceTrimLoop: true });
+    const handleLoadedMetadata = () => updateCurrentTime({ enforceTrimLoop: true });
     const handlePlay = () => {
-      updateCurrentTime();
+      clampPlaybackToTrimOnPlay();
+      updateCurrentTime({ enforceTrimLoop: true });
       scheduleTimeTracking();
     };
     const handlePause = () => {
-      updateCurrentTime();
+      updateCurrentTime({ enforceTrimLoop: true });
       cancelTimeTracking();
     };
     const handleEnded = () => {
-      updateCurrentTime();
+      updateCurrentTime({ enforceTrimLoop: true });
       cancelTimeTracking();
     };
 
     video.addEventListener('timeupdate', handleTimeUpdate);
     video.addEventListener('seeking', handleSeeking);
     video.addEventListener('seeked', handleSeeked);
-    video.addEventListener('seeking', handleSeeking);
     video.addEventListener('loadedmetadata', handleLoadedMetadata);
     video.addEventListener('play', handlePlay);
     video.addEventListener('pause', handlePause);
@@ -2058,13 +2123,12 @@ export default function VideoDetailPage() {
       video.removeEventListener('timeupdate', handleTimeUpdate);
       video.removeEventListener('seeking', handleSeeking);
       video.removeEventListener('seeked', handleSeeked);
-      video.removeEventListener('seeking', handleSeeking);
       video.removeEventListener('loadedmetadata', handleLoadedMetadata);
       video.removeEventListener('play', handlePlay);
       video.removeEventListener('pause', handlePause);
       video.removeEventListener('ended', handleEnded);
     };
-  }, [videoUrl, cancelTimeTracking, scheduleTimeTracking, updateCurrentTime]);
+  }, [videoUrl, cancelTimeTracking, clampPlaybackToTrimOnPlay, scheduleTimeTracking, updateCurrentTime]);
 
   return (
     <main className="video-detail-page">
@@ -2853,46 +2917,75 @@ export default function VideoDetailPage() {
                     <p style={{ margin: 0, color: '#111', fontWeight: 600 }}>트리밍 구간</p>
                     <div
                       style={{
-                        display: 'grid',
-                        gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))',
-                        gap: 8,
-                        fontSize: 13,
+                        display: 'flex',
+                        alignItems: 'center',
+                        gap: 12,
                         flex: 1,
+                        justifyContent: 'flex-end',
+                        flexWrap: 'wrap',
                       }}
                     >
                       <div
                         style={{
+                          display: 'grid',
+                          gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))',
+                          gap: 8,
+                          fontSize: 13,
+                          flex: 1,
+                        }}
+                      >
+                        <div
+                          style={{
+                            color: '#111',
+                            whiteSpace: 'nowrap',
+                            overflow: 'hidden',
+                            textOverflow: 'ellipsis',
+                            fontVariantNumeric: 'tabular-nums',
+                          }}
+                        >
+                          시작: <strong>{selection ? formatMsWithSeconds(selection.startMs) : '--'}</strong>
+                        </div>
+                        <div
+                          style={{
+                            color: '#111',
+                            whiteSpace: 'nowrap',
+                            overflow: 'hidden',
+                            textOverflow: 'ellipsis',
+                            fontVariantNumeric: 'tabular-nums',
+                          }}
+                        >
+                          종료: <strong>{selection ? formatMsWithSeconds(selection.endMs) : '--'}</strong>
+                        </div>
+                        <div
+                          style={{
+                            color: '#555',
+                            whiteSpace: 'nowrap',
+                            overflow: 'hidden',
+                            textOverflow: 'ellipsis',
+                            fontVariantNumeric: 'tabular-nums',
+                          }}
+                        >
+                          길이: {selection ? formatMsWithSeconds(selection.durationMs) : '--'}
+                        </div>
+                      </div>
+                      <label
+                        style={{
+                          display: 'flex',
+                          alignItems: 'center',
+                          gap: 6,
+                          fontSize: 13,
                           color: '#111',
                           whiteSpace: 'nowrap',
-                          overflow: 'hidden',
-                          textOverflow: 'ellipsis',
-                          fontVariantNumeric: 'tabular-nums',
                         }}
                       >
-                        시작: <strong>{selection ? formatMsWithSeconds(selection.startMs) : '--'}</strong>
-                      </div>
-                      <div
-                        style={{
-                          color: '#111',
-                          whiteSpace: 'nowrap',
-                          overflow: 'hidden',
-                          textOverflow: 'ellipsis',
-                          fontVariantNumeric: 'tabular-nums',
-                        }}
-                      >
-                        종료: <strong>{selection ? formatMsWithSeconds(selection.endMs) : '--'}</strong>
-                      </div>
-                      <div
-                        style={{
-                          color: '#555',
-                          whiteSpace: 'nowrap',
-                          overflow: 'hidden',
-                          textOverflow: 'ellipsis',
-                          fontVariantNumeric: 'tabular-nums',
-                        }}
-                      >
-                        길이: {selection ? formatMsWithSeconds(selection.durationMs) : '--'}
-                      </div>
+                        <input
+                          type="checkbox"
+                          checked={shouldLoopTrim}
+                          disabled={!trimRangeSummary}
+                          onChange={(event) => setShouldLoopTrim(event.target.checked)}
+                        />
+                        <span>트림 구간만 반복 재생</span>
+                      </label>
                     </div>
                   </div>
                   <div
