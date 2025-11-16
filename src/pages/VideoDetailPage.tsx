@@ -86,6 +86,66 @@ function formatMsWithSeconds(valueMs: number) {
   return `${clamped}ms (${seconds}s)`;
 }
 
+type HotkeyConfig = {
+  togglePlay: string;
+  setStart: string;
+  setEnd: string;
+  confirm: string;
+};
+
+const DEFAULT_HOTKEYS: HotkeyConfig = {
+  togglePlay: ' ',
+  setStart: '[',
+  setEnd: ']',
+  confirm: 'Enter',
+};
+
+const HOTKEY_STORAGE_KEY = 'caption_hotkeys';
+
+const WINDOW_KEYDOWN_CAPTURE_OPTS = { capture: true } as const;
+
+const INVALID_HOTKEY_KEYS = new Set([
+  'Shift',
+  'Control',
+  'Alt',
+  'Meta',
+  'CapsLock',
+]);
+
+function normalizeEventKey(key: string) {
+  // 일부 구형/특정 환경 대응
+  if (key === 'Spacebar') return ' ';
+  return key;
+}
+
+function isInvalidHotkeyKey(key: string) {
+  return INVALID_HOTKEY_KEYS.has(key);
+}
+
+function sanitizeHotkeyConfig(value: unknown): HotkeyConfig {
+  if (!value || typeof value !== 'object') return { ...DEFAULT_HOTKEYS };
+
+  const parsed = value as Record<keyof HotkeyConfig, unknown>;
+  const next: HotkeyConfig = { ...DEFAULT_HOTKEYS };
+
+  for (const key of Object.keys(DEFAULT_HOTKEYS) as (keyof HotkeyConfig)[]) {
+    const candidate = parsed[key];
+    if (typeof candidate === 'string' && candidate.length > 0) {
+      next[key] = candidate;
+    }
+  }
+
+  return next;
+}
+
+function formatKeyLabel(key: string) {
+  if (key === ' ') return 'Space';
+  if (key === 'Enter') return 'Enter';
+  if (key === 'ArrowLeft') return 'ArrowLeft';
+  if (key === 'ArrowRight') return 'ArrowRight';
+  return key.length === 1 ? key.toUpperCase() : key;
+}
+
 function sanitizeForFileName(text: string, fallback: string) {
   const safe = text.replace(/[^a-zA-Z0-9-_]+/g, '_').replace(/_+/g, '_').replace(/^_+|_+$/g, '');
   return safe || fallback;
@@ -150,6 +210,18 @@ export default function VideoDetailPage() {
   const [trimRange, setTrimRange] = useState<{ startMs: number; endMs: number } | null>(null);
   const [shouldLoopTrim, setShouldLoopTrim] = useState(false);
   const [applyTrimOnExport, setApplyTrimOnExport] = useState(false);
+  const [hotkeyConfig, setHotkeyConfig] = useState<HotkeyConfig>(() => {
+    if (typeof window === 'undefined') return { ...DEFAULT_HOTKEYS };
+    try {
+      const stored = localStorage.getItem(HOTKEY_STORAGE_KEY);
+      if (!stored) return { ...DEFAULT_HOTKEYS };
+      const parsed = JSON.parse(stored);
+      return sanitizeHotkeyConfig(parsed);
+    } catch {
+      return { ...DEFAULT_HOTKEYS };
+    }
+  });
+  const [capturingHotkey, setCapturingHotkey] = useState<keyof HotkeyConfig | null>(null);
   const [snapStepMs, setSnapStepMs] = useState<100 | 1000>(100);
   const [trimInputSeconds, setTrimInputSeconds] = useState<{ start: string; end: string }>({
     start: '',
@@ -198,6 +270,14 @@ export default function VideoDetailPage() {
   const waveformSamplesReadyRef = useRef(false);
   const waveformOverviewPeaksRef = useRef<Int16Array | null>(null);
   const waveformBucketCountRef = useRef<number | null>(null);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(HOTKEY_STORAGE_KEY, JSON.stringify(hotkeyConfig));
+    } catch {
+      // ignore
+    }
+  }, [hotkeyConfig]);
   const waveformPendingBucketRef = useRef<number | null>(null);
   const waveformComputeTimeoutRef = useRef<number | null>(null);
   const waveformComputeTokenRef = useRef<number>(0);
@@ -207,6 +287,7 @@ export default function VideoDetailPage() {
   const shouldLoopTrimRef = useRef(false);
   const normalizedTrimRangeRef = useRef<ReturnType<typeof normalizeTrimRange>>(null);
   const captionRefs = useRef<Record<string, HTMLLIElement | null>>({});
+  const prevCaptionIdsRef = useRef<string[]>([]);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const [currentTimeMs, setCurrentTimeMs] = useState<number | null>(null);
   const [lastFocusedCaptionId, setLastFocusedCaptionId] = useState<string | null>(null);
@@ -1070,9 +1151,23 @@ export default function VideoDetailPage() {
     );
   }, [activeCaptionId, captionDrafts, lastFocusedCaptionId]);
 
+  const hotkeyItems: { key: keyof HotkeyConfig; label: string; description: string }[] = [
+    { key: 'togglePlay', label: '재생/정지', description: '영상 재생·일시정지' },
+    { key: 'setStart', label: '시작 설정', description: '현재 재생 위치를 시작 시간으로 설정' },
+    { key: 'setEnd', label: '종료 설정', description: '현재 재생 위치를 종료 시간으로 설정' },
+    { key: 'confirm', label: '자막 추가', description: '새 자막을 추가하고 포커스 유지' },
+  ];
+
   useEffect(() => {
+    const hotkeyValues = new Set(Object.values(hotkeyConfig));
+
     const handleKeyDown = (event: KeyboardEvent) => {
+      if (capturingHotkey) return;
+      if (event.isComposing) return;
       if (event.metaKey || event.ctrlKey || event.altKey) return;
+
+      const eventKey = normalizeEventKey(event.key);
+      if (!eventKey || eventKey === 'Process') return;
 
       const target = event.target as HTMLElement | null;
       const isTypingTarget =
@@ -1083,39 +1178,124 @@ export default function VideoDetailPage() {
           target.tagName === 'BUTTON' ||
           target.tagName === 'A' ||
           target.isContentEditable);
-      if (isTypingTarget) return;
 
-      if (event.key === ' ') {
+      if (isTypingTarget && !hotkeyValues.has(eventKey)) return;
+
+      if (eventKey === hotkeyConfig.togglePlay) {
+        event.stopPropagation();
         event.preventDefault();
         togglePlayback();
         return;
       }
 
-      if (event.key === '[') {
+      if (eventKey === hotkeyConfig.setStart) {
+        event.stopPropagation();
         event.preventDefault();
         const targetCaptionId = getShortcutTargetCaptionId();
         if (targetCaptionId) handleSetCaptionTimeFromVideo(targetCaptionId, 'startMs');
         return;
       }
 
-      if (event.key === ']') {
+      if (eventKey === hotkeyConfig.setEnd) {
+        event.stopPropagation();
         event.preventDefault();
         const targetCaptionId = getShortcutTargetCaptionId();
         if (targetCaptionId) handleSetCaptionTimeFromVideo(targetCaptionId, 'endMs');
         return;
       }
 
-      if (event.key === 'Enter') {
+      if (eventKey === hotkeyConfig.confirm) {
+        event.stopPropagation();
         event.preventDefault();
         handleAddCaption();
       }
     };
 
-    window.addEventListener('keydown', handleKeyDown);
+    window.addEventListener('keydown', handleKeyDown, WINDOW_KEYDOWN_CAPTURE_OPTS);
     return () => {
-      window.removeEventListener('keydown', handleKeyDown);
+      window.removeEventListener('keydown', handleKeyDown, WINDOW_KEYDOWN_CAPTURE_OPTS);
     };
-  }, [getShortcutTargetCaptionId, handleAddCaption, handleSetCaptionTimeFromVideo, togglePlayback]);
+  }, [
+    capturingHotkey,
+    getShortcutTargetCaptionId,
+    handleAddCaption,
+    handleSetCaptionTimeFromVideo,
+    hotkeyConfig,
+    togglePlayback,
+  ]);
+
+  useEffect(() => {
+    if (!capturingHotkey) return;
+
+    const handleCapture = (event: KeyboardEvent) => {
+      if (event.isComposing) return;
+      if (event.metaKey || event.ctrlKey || event.altKey) return;
+
+      const eventKey = normalizeEventKey(event.key);
+      if (!eventKey || eventKey === 'Process') return;
+
+      event.stopPropagation();
+      event.preventDefault();
+
+      if (eventKey === 'Escape') {
+        setCapturingHotkey(null);
+        return;
+      }
+
+      if (isInvalidHotkeyKey(eventKey)) {
+        return;
+      }
+
+      setHotkeyConfig((prev) => ({ ...prev, [capturingHotkey]: eventKey }));
+      setCapturingHotkey(null);
+    };
+
+    window.addEventListener('keydown', handleCapture, WINDOW_KEYDOWN_CAPTURE_OPTS);
+    return () => {
+      window.removeEventListener('keydown', handleCapture, WINDOW_KEYDOWN_CAPTURE_OPTS);
+    };
+  }, [capturingHotkey]);
+
+  useEffect(() => {
+    const prevIds = prevCaptionIdsRef.current;
+    const nextIds = captionDrafts.map((c) => c.id);
+
+    // 다음 렌더부터 비교할 수 있게 먼저 갱신
+    prevCaptionIdsRef.current = nextIds;
+
+    const prevSet = new Set(prevIds);
+    const added = nextIds.filter((id) => !prevSet.has(id));
+
+    // import처럼 여러 개가 한 번에 추가되는 케이스는 건드리지 않음
+    if (added.length !== 1) return;
+
+    const newCaptionId = added[0] ?? null;
+    if (!newCaptionId) return;
+
+    setLastFocusedCaptionId(newCaptionId);
+
+    if (typeof window === 'undefined') return;
+
+    let tries = 0;
+    const tryFocus = () => {
+      tries += 1;
+      const root = captionRefs.current[newCaptionId];
+      const el = root?.querySelector(
+        // 우선 textarea(자막 내용), 없으면 text input(혹시 구조가 다를 때)
+        'textarea, input[type="text"], input:not([type])',
+      ) as HTMLTextAreaElement | HTMLInputElement | null;
+
+      if (el) {
+        el.focus();
+        if ('select' in el) el.select?.();
+        return;
+      }
+
+      if (tries < 8) window.setTimeout(tryFocus, 25);
+    };
+
+    window.setTimeout(tryFocus, 0);
+  }, [captionDrafts]);
 
   const handleDeleteCaption = useCallback((captionId: string) => {
     resetSaveCaptionsError();
@@ -2254,6 +2434,90 @@ export default function VideoDetailPage() {
                   마지막 저장: {new Date(lastSavedAt).toLocaleTimeString()}
                 </span>
               ) : null}
+            </div>
+
+            <div
+              style={{
+                display: 'grid',
+                gap: 10,
+                padding: 12,
+                borderRadius: 10,
+                border: '1px solid #e6e6e6',
+                background: '#f8fafc',
+              }}
+            >
+              <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+                <strong style={{ fontSize: 14, color: '#111' }}>단축키 설정</strong>
+                <span style={{ fontSize: 12, color: '#555' }}>
+                  입력창 포커스 상태에서도 동작하며, IME 조합 중에는 동작하지 않아요.
+                </span>
+                <div style={{ flex: 1 }} />
+                <button
+                  type="button"
+                  onClick={() => {
+                    setCapturingHotkey(null);
+                    setHotkeyConfig({ ...DEFAULT_HOTKEYS });
+                  }}
+                  style={{
+                    padding: '6px 10px',
+                    borderRadius: 6,
+                    border: '1px solid #cbd5e1',
+                    background: '#fff',
+                    color: '#111',
+                    cursor: 'pointer',
+                  }}
+                >
+                  기본값 복원
+                </button>
+              </div>
+              <div
+                style={{
+                  display: 'grid',
+                  gap: 8,
+                  gridTemplateColumns: 'repeat(auto-fit, minmax(240px, 1fr))',
+                }}
+              >
+                {hotkeyItems.map((item) => {
+                  const isCapturing = capturingHotkey === item.key;
+                  return (
+                    <div
+                      key={item.key}
+                      style={{
+                        display: 'flex',
+                        alignItems: 'center',
+                        justifyContent: 'space-between',
+                        gap: 12,
+                        padding: '8px 10px',
+                        borderRadius: 8,
+                        border: '1px solid #e2e8f0',
+                        background: '#fff',
+                      }}
+                    >
+                      <div style={{ display: 'grid', gap: 2, minWidth: 0 }}>
+                        <span style={{ fontSize: 13, color: '#111', fontWeight: 600 }}>{item.label}</span>
+                        <span style={{ fontSize: 12, color: '#555', wordBreak: 'keep-all' }}>
+                          {item.description}
+                        </span>
+                      </div>
+                      <button
+                        type="button"
+                        onClick={() => setCapturingHotkey(item.key)}
+                        style={{
+                          padding: '6px 10px',
+                          borderRadius: 6,
+                          border: isCapturing ? '1px solid #111' : '1px solid #cbd5e1',
+                          background: isCapturing ? '#111' : '#f8fafc',
+                          color: isCapturing ? '#fff' : '#111',
+                          cursor: 'pointer',
+                          minWidth: 120,
+                        }}
+                      >
+                        {isCapturing ? '입력 대기… (Esc)' : formatKeyLabel(hotkeyConfig[item.key])}
+                      </button>
+                    </div>
+                  );
+                })}
+              </div>
             </div>
 
             {isCaptionsLoading ? (
