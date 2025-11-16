@@ -1262,6 +1262,12 @@ export default function VideoDetailPage() {
     return { durationSeconds, startMs, endMs, startSeconds, endSeconds };
   }, [normalizedTrimRange]);
 
+  const canApplyTrimFromCurrentTime =
+    Boolean(normalizedTrimRange) &&
+    typeof effectiveDurationMs === 'number' &&
+    typeof currentTimeMs === 'number' &&
+    Number.isFinite(currentTimeMs);
+
   const handleTrimExport = useCallback(async () => {
     if (!applyTrimOnExport) return;
 
@@ -2069,6 +2075,39 @@ export default function VideoDetailPage() {
       }
     },
     [effectiveDurationMs, trimRange, trimRangeSummary?.endSeconds, trimRangeSummary?.startSeconds, updateTrimRange],
+  );
+
+  const applyTrimFromCurrentTime = useCallback(
+    (field: 'start' | 'end') => {
+      if (typeof effectiveDurationMs !== 'number') return;
+
+      const nowMs = getCurrentTimeMs();
+      if (!Number.isFinite(nowMs)) return;
+
+      const snapped = snapToStep(nowMs, snapStepMs);
+      const clamped = clampToDuration(snapped);
+      const base =
+        normalizedTrimRangeRef.current ?? normalizeTrimRange(trimRangeRef.current, effectiveDurationMs);
+      if (!base) return;
+
+      const draftStart = field === 'start' ? clamped : Math.min(base.trimStart, clamped);
+      const draftEnd = field === 'end' ? clamped : Math.max(base.trimEnd, clamped);
+      const normalized = normalizeTrimRange({ startMs: draftStart, endMs: draftEnd }, effectiveDurationMs);
+      if (!normalized) return;
+
+      const nextRange = { startMs: normalized.trimStart, endMs: normalized.trimEnd };
+      updateTrimRange(nextRange);
+
+      setTrimInputSeconds((prev) => {
+        const startText = formatSeconds(normalized.trimStart);
+        const endText = formatSeconds(normalized.trimEnd);
+        return {
+          start: field === 'start' ? startText : trimInputFocusRef.current === 'start' ? prev.start : startText,
+          end: field === 'end' ? endText : trimInputFocusRef.current === 'end' ? prev.end : endText,
+        };
+      });
+    },
+    [clampToDuration, effectiveDurationMs, getCurrentTimeMs, snapStepMs, updateTrimRange],
   );
   useEffect(() => {
     if (!dragTarget) return undefined;
@@ -3066,41 +3105,79 @@ export default function VideoDetailPage() {
                   >
                     <label style={{ display: 'grid', gap: 4 }}>
                       <span style={{ fontSize: 12, color: '#555' }}>시작 (초)</span>
-                      <input
-                        type="number"
-                        inputMode="decimal"
-                        min={0}
-                        step={0.01}
-                        value={trimInputSeconds.start}
-                        onFocus={handleTrimSecondsFocus('start')}
-                        onChange={(event) => handleTrimSecondsChange('start', event.target.value)}
-                        onBlur={handleTrimSecondsBlur('start')}
-                        style={{
-                          padding: '8px 10px',
-                          borderRadius: 6,
-                          border: '1px solid #cbd5e1',
-                          fontVariantNumeric: 'tabular-nums',
-                        }}
-                      />
+                      <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+                        <input
+                          type="number"
+                          inputMode="decimal"
+                          min={0}
+                          step={0.01}
+                          value={trimInputSeconds.start}
+                          onFocus={handleTrimSecondsFocus('start')}
+                          onChange={(event) => handleTrimSecondsChange('start', event.target.value)}
+                          onBlur={handleTrimSecondsBlur('start')}
+                          onDoubleClick={() => applyTrimFromCurrentTime('start')}
+                          style={{
+                            padding: '8px 10px',
+                            borderRadius: 6,
+                            border: '1px solid #cbd5e1',
+                            fontVariantNumeric: 'tabular-nums',
+                          }}
+                        />
+                        <button
+                          type="button"
+                          onClick={() => applyTrimFromCurrentTime('start')}
+                          disabled={!canApplyTrimFromCurrentTime}
+                          aria-label="현재 시간으로 시작 설정"
+                          style={{
+                            padding: '6px 10px',
+                            borderRadius: 6,
+                            border: '1px solid #cbd5e1',
+                            background: '#f8fafc',
+                            color: '#111',
+                            cursor: canApplyTrimFromCurrentTime ? 'pointer' : 'not-allowed',
+                          }}
+                        >
+                          현재
+                        </button>
+                      </div>
                     </label>
                     <label style={{ display: 'grid', gap: 4 }}>
                       <span style={{ fontSize: 12, color: '#555' }}>종료 (초)</span>
-                      <input
-                        type="number"
-                        inputMode="decimal"
-                        min={0}
-                        step={0.01}
-                        value={trimInputSeconds.end}
-                        onFocus={handleTrimSecondsFocus('end')}
-                        onChange={(event) => handleTrimSecondsChange('end', event.target.value)}
-                        onBlur={handleTrimSecondsBlur('end')}
-                        style={{
-                          padding: '8px 10px',
-                          borderRadius: 6,
-                          border: '1px solid #cbd5e1',
-                          fontVariantNumeric: 'tabular-nums',
-                        }}
-                      />
+                      <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+                        <input
+                          type="number"
+                          inputMode="decimal"
+                          min={0}
+                          step={0.01}
+                          value={trimInputSeconds.end}
+                          onFocus={handleTrimSecondsFocus('end')}
+                          onChange={(event) => handleTrimSecondsChange('end', event.target.value)}
+                          onBlur={handleTrimSecondsBlur('end')}
+                          onDoubleClick={() => applyTrimFromCurrentTime('end')}
+                          style={{
+                            padding: '8px 10px',
+                            borderRadius: 6,
+                            border: '1px solid #cbd5e1',
+                            fontVariantNumeric: 'tabular-nums',
+                          }}
+                        />
+                        <button
+                          type="button"
+                          onClick={() => applyTrimFromCurrentTime('end')}
+                          disabled={!canApplyTrimFromCurrentTime}
+                          aria-label="현재 시간으로 종료 설정"
+                          style={{
+                            padding: '6px 10px',
+                            borderRadius: 6,
+                            border: '1px solid #cbd5e1',
+                            background: '#f8fafc',
+                            color: '#111',
+                            cursor: canApplyTrimFromCurrentTime ? 'pointer' : 'not-allowed',
+                          }}
+                        >
+                          현재
+                        </button>
+                      </div>
                     </label>
                   </div>
                   <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center' }}>
