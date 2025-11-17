@@ -104,6 +104,8 @@ const HOTKEY_STORAGE_KEY = 'caption_hotkeys';
 
 const WINDOW_KEYDOWN_CAPTURE_OPTS = { capture: true } as const;
 
+const CAPTION_GAP_MS_STORAGE_KEY = 'caption_gap_ms';
+
 const INVALID_HOTKEY_KEYS = new Set([
   'Shift',
   'Control',
@@ -144,6 +146,12 @@ function formatKeyLabel(key: string) {
   if (key === 'ArrowLeft') return 'ArrowLeft';
   if (key === 'ArrowRight') return 'ArrowRight';
   return key.length === 1 ? key.toUpperCase() : key;
+}
+
+function parseCaptionGapMs(raw: unknown) {
+  const parsed = typeof raw === 'string' ? Number(raw) : Number.NaN;
+  if (!Number.isFinite(parsed)) return 1;
+  return Math.max(0, Math.round(parsed));
 }
 
 function sanitizeForFileName(text: string, fallback: string) {
@@ -197,6 +205,30 @@ function getCaptionErrors(caption: Caption): CaptionErrors {
   return errors;
 }
 
+function autoAlignCaptions(captions: Caption[], gapMs: number) {
+  const sorted = sortCaptions(captions);
+  let prevEnd: number | null = null;
+
+  return sorted.map((caption) => {
+    let startMs = caption.startMs;
+    let endMs = caption.endMs;
+
+    if (!Number.isFinite(startMs)) {
+      startMs = Number.isFinite(prevEnd) ? (prevEnd as number) + gapMs : 0;
+    } else if (Number.isFinite(prevEnd) && startMs < (prevEnd as number) + gapMs) {
+      startMs = (prevEnd as number) + gapMs;
+    }
+
+    if (!Number.isFinite(endMs) || (Number.isFinite(startMs) && endMs <= startMs)) {
+      endMs = (Number.isFinite(startMs) ? (startMs as number) : 0) + 1000;
+    }
+
+    prevEnd = Number.isFinite(endMs) ? endMs : prevEnd;
+
+    return { ...caption, startMs, endMs };
+  });
+}
+
 export default function VideoDetailPage() {
   const { id } = useParams<{ id: string }>();
 
@@ -219,6 +251,15 @@ export default function VideoDetailPage() {
       return sanitizeHotkeyConfig(parsed);
     } catch {
       return { ...DEFAULT_HOTKEYS };
+    }
+  });
+  const [captionGapMs, setCaptionGapMs] = useState<number>(() => {
+    if (typeof window === 'undefined') return 1;
+    try {
+      const stored = localStorage.getItem(CAPTION_GAP_MS_STORAGE_KEY);
+      return parseCaptionGapMs(stored);
+    } catch {
+      return 1;
     }
   });
   const [capturingHotkey, setCapturingHotkey] = useState<keyof HotkeyConfig | null>(null);
@@ -278,6 +319,13 @@ export default function VideoDetailPage() {
       // ignore
     }
   }, [hotkeyConfig]);
+  useEffect(() => {
+    try {
+      localStorage.setItem(CAPTION_GAP_MS_STORAGE_KEY, captionGapMs.toString());
+    } catch {
+      // ignore
+    }
+  }, [captionGapMs]);
   const waveformPendingBucketRef = useRef<number | null>(null);
   const waveformComputeTimeoutRef = useRef<number | null>(null);
   const waveformComputeTokenRef = useRef<number>(0);
@@ -287,6 +335,7 @@ export default function VideoDetailPage() {
   const shouldLoopTrimRef = useRef(false);
   const normalizedTrimRangeRef = useRef<ReturnType<typeof normalizeTrimRange>>(null);
   const captionRefs = useRef<Record<string, HTMLLIElement | null>>({});
+  const pendingCaptionTextFocusIdRef = useRef<string | null>(null);
   const prevCaptionIdsRef = useRef<string[]>([]);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const [currentTimeMs, setCurrentTimeMs] = useState<number | null>(null);
@@ -440,6 +489,10 @@ export default function VideoDetailPage() {
     }
   }, [captions]);
 
+  useEffect(() => {
+    setCaptionDrafts((prev) => autoAlignCaptions(prev, captionGapMs));
+  }, [captionGapMs]);
+
   const hasCaptionErrors = useMemo(
     () => captionDrafts.some((c) => Object.keys(getCaptionErrors(c)).length > 0),
     [captionDrafts],
@@ -470,20 +523,24 @@ export default function VideoDetailPage() {
       setImportError(null);
       const nextNumber =
         value.trim() === '' ? Number.NaN : Number(value);
-      setCaptionDrafts((prev) =>
-        sortCaptions(
-          prev.map((caption) =>
-            caption.id === captionId
-              ? {
-                  ...caption,
-                  [field]: field === 'text' ? value : nextNumber,
-                }
-              : caption,
-          ),
-        ),
-      );
+      setCaptionDrafts((prev) => {
+        const next = prev.map((caption) =>
+          caption.id === captionId
+            ? {
+                ...caption,
+                [field]: field === 'text' ? value : nextNumber,
+              }
+            : caption,
+        );
+
+        if (field === 'text') return sortCaptions(next);
+        // 숫자 입력은 "비우고 다시 타이핑"을 허용해야 함.
+        // 빈값(NaN)인 동안은 자동 정렬로 값을 다시 채우지 않는다.
+        if (!Number.isFinite(nextNumber)) return next;
+        return autoAlignCaptions(next, captionGapMs);return autoAlignCaptions(next, captionGapMs);
+      });
     },
-    [resetSaveCaptionsError],
+    [captionGapMs, resetSaveCaptionsError],
   );
 
   const getCurrentTimeMs = useCallback(() => {
@@ -731,13 +788,72 @@ export default function VideoDetailPage() {
     const nextCaptionId = createCaptionId();
     const currentTimeMs = getCurrentTimeMs();
     setCaptionDrafts((prev) => {
-      const startMs = Number.isFinite(currentTimeMs) ? currentTimeMs : getLastValidEndMs(prev);
+      const aligned = autoAlignCaptions(prev, captionGapMs);
+      const lastEndMs = getLastValidEndMs(aligned);
+      const hasValidEnd = aligned.some((caption) => Number.isFinite(caption.endMs));
+      const minimumStart = hasValidEnd ? lastEndMs + captionGapMs : 0;
+      const startMs = Number.isFinite(currentTimeMs)
+        ? Math.max(currentTimeMs, minimumStart)
+        : minimumStart;
       const endMs = startMs + 1000;
-      const next = [...prev, { id: nextCaptionId, startMs, endMs, text: '' }];
-      return sortCaptions(next);
+      const next = [...aligned, { id: nextCaptionId, startMs, endMs, text: '' }];
+      return autoAlignCaptions(next, captionGapMs);
     });
     setLastFocusedCaptionId(nextCaptionId);
-  }, [getCurrentTimeMs, resetSaveCaptionsError]);
+    pendingCaptionTextFocusIdRef.current = nextCaptionId;
+  }, [captionGapMs, getCurrentTimeMs, resetSaveCaptionsError]);
+
+  const handleConfirmCaption = useCallback(
+    (captionId: string) => {
+      resetSaveCaptionsError();
+      setImportError(null);
+      let createdId: string | null = null;
+      setCaptionDrafts((prev) => {
+        const aligned = autoAlignCaptions(prev, captionGapMs);
+        const targetIndex = aligned.findIndex((caption) => caption.id === captionId);
+        if (targetIndex === -1) return aligned;
+
+        const target = aligned[targetIndex];
+        if (!target) return aligned;
+        if (!target.text.trim()) return aligned;
+
+        const targetEnd = Number.isFinite(target.endMs)
+          ? target.endMs
+          : getLastValidEndMs(aligned.slice(0, targetIndex + 1));
+        const nextStart = (Number.isFinite(targetEnd) ? (targetEnd as number) : 0) + captionGapMs;
+
+        const nextCaption: Caption = {
+          id: createCaptionId(),
+          startMs: nextStart,
+          endMs: nextStart + 1000,
+          text: '',
+        };
+
+        createdId = nextCaption.id;
+
+        const nextCaptions = [...aligned];
+        nextCaptions.splice(targetIndex + 1, 0, nextCaption);
+        return autoAlignCaptions(nextCaptions, captionGapMs);
+      });
+
+      if (createdId) {
+        setLastFocusedCaptionId(createdId);
+        pendingCaptionTextFocusIdRef.current = createdId;
+      }
+    },
+    [captionGapMs, resetSaveCaptionsError],
+  );
+
+  useEffect(() => {
+    const targetId = pendingCaptionTextFocusIdRef.current;
+    if (!targetId) return;
+    const rowEl = captionRefs.current[targetId];
+    if (!rowEl) return;
+    const inputEl = rowEl.querySelector('textarea, input') as HTMLElement | null;
+    if (!inputEl) return;
+    inputEl.focus();
+    pendingCaptionTextFocusIdRef.current = null;
+  }, [captionDrafts]);
 
   const handleSetCaptionTimeFromVideo = useCallback(
     (captionId: string, field: keyof Pick<Caption, 'startMs' | 'endMs'>) => {
@@ -1119,7 +1235,7 @@ export default function VideoDetailPage() {
       try {
         const text = await file.text();
         const imported = parseCaptionsFromJson(text, createCaptionId);
-        setCaptionDrafts(sortCaptions(imported));
+        setCaptionDrafts(autoAlignCaptions(imported, captionGapMs));
         setImportError(null);
         resetSaveCaptionsError();
       } catch (err) {
@@ -1128,7 +1244,7 @@ export default function VideoDetailPage() {
         event.target.value = '';
       }
     },
-    [resetSaveCaptionsError],
+    [captionGapMs, resetSaveCaptionsError],
   );
 
   const togglePlayback = useCallback(() => {
@@ -1179,6 +1295,12 @@ export default function VideoDetailPage() {
           target.tagName === 'A' ||
           target.isContentEditable);
 
+      // textarea(자막 내용)에서 Enter는 로컬(onKeyDown)로 처리한다.
+      // - Enter: 확정(다음 자막 생성)
+      // - Shift+Enter: 줄바꿈
+      // window capture에서 Enter를 먹어버리면 Shift+Enter도 확정으로 동작하거나,
+      // Enter가 중복 처리되어 자막이 2개 생길 수 있다.
+      if (target?.tagName === 'TEXTAREA' && eventKey === 'Enter') return;
       if (isTypingTarget && !hotkeyValues.has(eventKey)) return;
 
       if (eventKey === hotkeyConfig.togglePlay) {
@@ -1205,6 +1327,9 @@ export default function VideoDetailPage() {
       }
 
       if (eventKey === hotkeyConfig.confirm) {
+        // confirm이 Enter일 때 Shift+Enter는 textarea 줄바꿈으로 남겨둔다.
+        // (textarea가 아닌 곳에서도 실수로 확정되지 않게)
+        if (eventKey === 'Enter' && event.shiftKey) return;
         event.stopPropagation();
         event.preventDefault();
         handleAddCaption();
@@ -2407,7 +2532,11 @@ export default function VideoDetailPage() {
               borderRadius: 10,
               border: '1px solid #e6e6e6',
               background: '#fff',
-              display: 'grid',
+              // 자막 리스트가 길어지면 섹션 내부에서 스크롤되도록
+              display: 'flex',
+              flexDirection: 'column',
+              minHeight: 0,
+              maxHeight: '100vh',
               gap: 12,
             }}
           >
@@ -2518,6 +2647,43 @@ export default function VideoDetailPage() {
                   );
                 })}
               </div>
+              <div
+                style={{
+                  display: 'flex',
+                  alignItems: 'center',
+                  gap: 12,
+                  flexWrap: 'wrap',
+                }}
+              >
+                <strong style={{ fontSize: 14, color: '#111' }}>자동 시간 간격</strong>
+                <span style={{ fontSize: 12, color: '#555' }}>
+                  Enter로 자막을 확정하면 다음 자막의 시작 시간을 이전 종료 시간 뒤로 맞춰줘요.
+                </span>
+                <div style={{ flex: 1 }} />
+                <label
+                  style={{
+                    display: 'inline-flex',
+                    alignItems: 'center',
+                    gap: 8,
+                    fontSize: 13,
+                    color: '#111',
+                  }}
+                >
+                  간격(ms)
+                  <input
+                    type="number"
+                    min={0}
+                    value={captionGapMs}
+                    onChange={(e) => setCaptionGapMs(parseCaptionGapMs(e.target.value))}
+                    style={{
+                      padding: '6px 8px',
+                      borderRadius: 6,
+                      border: '1px solid #cbd5e1',
+                      width: 100,
+                    }}
+                  />
+                </label>
+              </div>
             </div>
 
             {isCaptionsLoading ? (
@@ -2553,8 +2719,16 @@ export default function VideoDetailPage() {
                 자막이 없어요. 새 자막을 추가해보세요.
               </p>
             ) : (
-              <ul style={{ listStyle: 'none', padding: 0, margin: 0, display: 'grid', gap: 12 }}>
-                {captionDrafts.map((caption) => {
+              <div
+                style={{
+                  flex: 1,
+                  minHeight: 0,
+                  overflowY: 'auto',
+                  paddingRight: 6,
+                }}
+              >
+                <ul style={{ listStyle: 'none', padding: 0, margin: 0, display: 'grid', gap: 12 }}>
+                  {captionDrafts.map((caption) => {
                   const errors = getCaptionErrors(caption);
                   const hasError = Object.keys(errors).length > 0;
                   const isActive = activeCaptionId === caption.id;
@@ -2660,16 +2834,24 @@ export default function VideoDetailPage() {
                         </label>
                         <label style={{ display: 'grid', gap: 4 }}>
                           <span style={{ fontSize: 12, color: '#555' }}>자막 내용</span>
-                          <input
-                            type="text"
+                          <textarea
                             value={caption.text}
                             onChange={(e) => handleCaptionFieldChange(caption.id, 'text', e.target.value)}
                             onFocus={() => setLastFocusedCaptionId(caption.id)}
+                            onKeyDown={(e) => {
+                              if (e.nativeEvent.isComposing) return;
+                              if (e.key === 'Enter' && !e.shiftKey) {
+                                e.preventDefault();
+                                handleConfirmCaption(caption.id);
+                              }
+                            }}
                             placeholder="자막을 입력하세요"
+                            rows={3}
                             style={{
                               padding: '8px 10px',
                               borderRadius: 6,
                               border: '1px solid #ccc',
+                              resize: 'vertical',
                             }}
                           />
                           {errors.text ? (
@@ -2698,7 +2880,8 @@ export default function VideoDetailPage() {
                     </li>
                   );
                 })}
-              </ul>
+                </ul>
+              </div>
             )}
 
             {isSaveCaptionsError ? (
