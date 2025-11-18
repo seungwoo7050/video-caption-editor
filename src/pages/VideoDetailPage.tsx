@@ -332,6 +332,9 @@ export default function VideoDetailPage() {
   const waveformLastComputeAtRef = useRef<number>(0);
   const waveformModeRef = useRef<'overview' | 'live' | 'loading'>('loading');
   const currentTimeMsRef = useRef<number | null>(null);
+  const waveformScrubPointerIdRef = useRef<number | null>(null);
+  const waveformScrubRafIdRef = useRef<number | null>(null);
+  const waveformPendingSeekMsRef = useRef<number | null>(null);
   const shouldLoopTrimRef = useRef(false);
   const normalizedTrimRangeRef = useRef<ReturnType<typeof normalizeTrimRange>>(null);
   const captionRefs = useRef<Record<string, HTMLLIElement | null>>({});
@@ -1801,6 +1804,125 @@ export default function VideoDetailPage() {
     return Math.max(64, width);
   }, []);
 
+  const xToMs = useCallback(
+    (x: number, width: number) => {
+      if (typeof effectiveDurationMs !== 'number' || effectiveDurationMs <= 0 || width <= 0) return null;
+      const ratio = x / width;
+      const ms = ratio * effectiveDurationMs;
+      return Math.min(Math.max(ms, 0), effectiveDurationMs);
+    },
+    [effectiveDurationMs],
+  );
+
+  const msToX = useCallback(
+    (ms: number, width: number) => {
+      if (typeof effectiveDurationMs !== 'number' || effectiveDurationMs <= 0 || width <= 0) return null;
+      const clampedMs = Math.min(Math.max(ms, 0), effectiveDurationMs);
+      return (clampedMs / effectiveDurationMs) * width;
+    },
+    [effectiveDurationMs],
+  );
+
+  const seekToMs = useCallback(
+    (ms: number) => {
+      const videoElement = videoRef.current;
+      if (!videoElement) return;
+      if (!Number.isFinite(ms)) return;
+      videoElement.currentTime = ms / 1000;
+      currentTimeMsRef.current = ms;
+      setCurrentTimeMs(ms);
+    },
+    [setCurrentTimeMs],
+  );
+
+  const handleWaveformPointerDown = useCallback(
+    (event: ReactPointerEvent<HTMLCanvasElement>) => {
+      const canvas = waveformCanvasRef.current;
+      const videoElement = videoRef.current;
+      if (!canvas || !videoElement) return;
+      // 좌클릭(또는 기본 포인터)만 처리
+      if (typeof event.button === 'number' && event.button !== 0) return;
+
+      // 모바일에서 스크롤/줌 제스처와 섞이지 않게 최소 방어
+      event.preventDefault();
+
+      const rect = canvas.getBoundingClientRect();
+      if (rect.width <= 0) return;
+      // 포인터 안정성(지금은 down만 쓰지만, 기본 방어로 캡처)
+      if (typeof canvas.setPointerCapture === 'function') {
+        try {
+          canvas.setPointerCapture(event.pointerId);
+        } catch {
+          // ignore
+        }
+      }
+
+      const ms = xToMs(event.clientX - rect.left, rect.width);
+      if (typeof ms !== 'number') return;
+
+      waveformScrubPointerIdRef.current = event.pointerId;
+      waveformPendingSeekMsRef.current = ms;
+      seekToMs(ms);
+    },
+    [seekToMs, xToMs],
+  );
+  
+  const handleWaveformPointerMove = useCallback(
+    (event: ReactPointerEvent<HTMLCanvasElement>) => {
+      const activePointerId = waveformScrubPointerIdRef.current;
+      if (activePointerId === null || activePointerId !== event.pointerId) return;
+
+      const canvas = waveformCanvasRef.current;
+      if (!canvas) return;
+
+      event.preventDefault();
+
+      const rect = canvas.getBoundingClientRect();
+      if (rect.width <= 0) return;
+
+      const ms = xToMs(event.clientX - rect.left, rect.width);
+      if (typeof ms !== 'number') return;
+
+      waveformPendingSeekMsRef.current = ms;
+
+      if (waveformScrubRafIdRef.current !== null) return;
+      waveformScrubRafIdRef.current = window.requestAnimationFrame(() => {
+        waveformScrubRafIdRef.current = null;
+        const pending = waveformPendingSeekMsRef.current;
+        if (typeof pending === 'number') seekToMs(pending);
+      });
+    },
+    [seekToMs, xToMs],
+  );
+
+  const handleWaveformPointerUp = useCallback(
+    (event: ReactPointerEvent<HTMLCanvasElement>) => {
+      const activePointerId = waveformScrubPointerIdRef.current;
+      if (activePointerId === null || activePointerId !== event.pointerId) return;
+
+      const canvas = waveformCanvasRef.current;
+      waveformScrubPointerIdRef.current = null;
+
+      if (waveformScrubRafIdRef.current !== null) {
+        window.cancelAnimationFrame(waveformScrubRafIdRef.current);
+        waveformScrubRafIdRef.current = null;
+      }
+
+      const pending = waveformPendingSeekMsRef.current;
+      waveformPendingSeekMsRef.current = null;
+      if (typeof pending === 'number') seekToMs(pending);
+
+      if (canvas && typeof canvas.releasePointerCapture === 'function') {
+        try {
+          canvas.releasePointerCapture(event.pointerId);
+        } catch {
+          // ignore
+        }
+      }
+    },
+    [seekToMs],
+  );
+
   const renderOverviewWaveform = useCallback(() => {
     const canvas = waveformCanvasRef.current;
     const peaks = waveformOverviewPeaksRef.current;
@@ -1842,16 +1964,18 @@ export default function VideoDetailPage() {
     context.stroke();
 
     if (typeof currentTimeMsRef.current === 'number' && typeof effectiveDurationMs === 'number' && effectiveDurationMs > 0) {
-      const ratio = Math.min(1, Math.max(0, currentTimeMsRef.current / effectiveDurationMs));
-      const x = ratio * width;
-      context.strokeStyle = '#ef4444';
-      context.lineWidth = Math.max(1, dpr * 1.2);
-      context.beginPath();
-      context.moveTo(x, 0);
-      context.lineTo(x, height);
-      context.stroke();
+      const clampedMs = Math.min(Math.max(currentTimeMsRef.current, 0), effectiveDurationMs);
+      const x = msToX(clampedMs, width);
+      if (typeof x === 'number') {
+        context.strokeStyle = '#ef4444';
+        context.lineWidth = Math.max(1, dpr * 1.2);
+        context.beginPath();
+        context.moveTo(x, 0);
+        context.lineTo(x, height);
+        context.stroke();
+      }
     }
-  }, [effectiveDurationMs]);
+  }, [effectiveDurationMs, msToX]);
 
   const computeOverviewPeaks = useCallback(
     async (bucketCount: number) => {
@@ -2069,8 +2193,19 @@ export default function VideoDetailPage() {
     }
 
     context.stroke();
+    if (typeof currentTimeMsRef.current === 'number') {
+      const x = msToX(currentTimeMsRef.current, width);
+      if (typeof x === 'number') {
+        context.strokeStyle = '#ef4444';
+        context.lineWidth = Math.max(1, dpr * 1.2);
+        context.beginPath();
+        context.moveTo(x, 0);
+        context.lineTo(x, height);
+        context.stroke();
+      }
+    }
     waveformRafIdRef.current = window.requestAnimationFrame(drawWaveform);
-  }, []);
+  }, [msToX]);
 
   const stopWaveform = useCallback(() => {
     if (waveformRafIdRef.current !== null) {
@@ -3719,7 +3854,17 @@ export default function VideoDetailPage() {
                   <p style={{ margin: '0 0 8px', color: '#333', fontSize: 14 }}>오디오 파형</p>
                   <canvas
                     ref={waveformCanvasRef}
-                    style={{ width: '100%', height: 96, display: 'block' }}
+                    onPointerDown={handleWaveformPointerDown}
+                    onPointerMove={handleWaveformPointerMove}
+                    onPointerUp={handleWaveformPointerUp}
+                    onPointerCancel={handleWaveformPointerUp}
+                    style={{
+                      width: '100%',
+                      height: 96,
+                      display: 'block',
+                      cursor: 'pointer',
+                      touchAction: 'none',
+                    }}
                   />
                 </div>
               </>
