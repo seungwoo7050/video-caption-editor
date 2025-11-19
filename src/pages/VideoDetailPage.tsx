@@ -101,6 +101,7 @@ const DEFAULT_HOTKEYS: HotkeyConfig = {
 };
 
 const HOTKEY_STORAGE_KEY = 'caption_hotkeys';
+const WAVEFORM_VIEWPORT_MIN_DURATION_MS = 500;
 
 const WINDOW_KEYDOWN_CAPTURE_OPTS = { capture: true } as const;
 
@@ -240,6 +241,7 @@ export default function VideoDetailPage() {
   const [importError, setImportError] = useState<string | null>(null);
   const [durationMs, setDurationMs] = useState<number | null>(null);
   const [trimRange, setTrimRange] = useState<{ startMs: number; endMs: number } | null>(null);
+  const [waveformViewport, setWaveformViewport] = useState<{ startMs: number; endMs: number } | null>(null);
   const [shouldLoopTrim, setShouldLoopTrim] = useState(false);
   const [applyTrimOnExport, setApplyTrimOnExport] = useState(false);
   const [hotkeyConfig, setHotkeyConfig] = useState<HotkeyConfig>(() => {
@@ -311,6 +313,15 @@ export default function VideoDetailPage() {
   const waveformSamplesReadyRef = useRef(false);
   const waveformOverviewPeaksRef = useRef<Int16Array | null>(null);
   const waveformBucketCountRef = useRef<number | null>(null);
+  const waveformViewportRef = useRef<{ startMs: number; endMs: number } | null>(null);
+  const waveformViewportCommitTimerRef = useRef<number | null>(null);
+  const renderOverviewWaveformRef = useRef<(() => void) | null>(null);
+  const waveformWheelRafIdRef = useRef<number | null>(null);
+  const waveformPendingWheelRef = useRef<
+    | { type: 'zoom'; deltaPx: number; width: number; anchorX: number }
+    | { type: 'pan'; deltaPx: number; width: number }
+    | null
+  >(null);
 
   useEffect(() => {
     try {
@@ -342,6 +353,7 @@ export default function VideoDetailPage() {
   const prevCaptionIdsRef = useRef<string[]>([]);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const [currentTimeMs, setCurrentTimeMs] = useState<number | null>(null);
+  const lastUiTimeUpdateAtRef = useRef<number>(0);
   const [lastFocusedCaptionId, setLastFocusedCaptionId] = useState<string | null>(null);
   const [shouldUseLiveWaveform, setShouldUseLiveWaveform] = useState(false);
   const videoFrameRequestIdRef = useRef<number | null>(null);
@@ -557,6 +569,20 @@ export default function VideoDetailPage() {
     return currentTimeMs;
   }, []);
 
+  const commitCurrentTimeMs = useCallback((ms: number | null) => {
+    currentTimeMsRef.current = ms;
+
+    // 10~15fps 정도만 UI 업데이트 (리스트 전체 리렌더 방지)
+    const now =
+      typeof performance !== 'undefined' && typeof performance.now === 'function'
+        ? performance.now()
+        : Date.now();
+
+    if (now - lastUiTimeUpdateAtRef.current < 100) return;
+    lastUiTimeUpdateAtRef.current = now;
+    setCurrentTimeMs(ms);
+  }, []);
+
   const applyTrimLoopIfNeeded = useCallback(
     (video: HTMLVideoElement, currentTimeMs: number) => {
       if (!shouldLoopTrimRef.current) return currentTimeMs;
@@ -580,7 +606,7 @@ export default function VideoDetailPage() {
     (options: { enforceTrimLoop?: boolean } = {}) => {
       const video = videoRef.current;
       if (!video) {
-        setCurrentTimeMs(null);
+        commitCurrentTimeMs(null);
         return;
       }
 
@@ -589,9 +615,9 @@ export default function VideoDetailPage() {
         ? applyTrimLoopIfNeeded(video, next)
         : next;
 
-      setCurrentTimeMs(Number.isFinite(adjusted) ? adjusted : null);
+      commitCurrentTimeMs(Number.isFinite(adjusted) ? adjusted : null);
     },
-    [applyTrimLoopIfNeeded, getCurrentTimeMs],
+    [applyTrimLoopIfNeeded, getCurrentTimeMs, commitCurrentTimeMs],
   );
 
   useEffect(() => {
@@ -1530,9 +1556,76 @@ export default function VideoDetailPage() {
     return normalizeTrimRange(trimRange, effectiveDurationMs);
   }, [effectiveDurationMs, trimRange]);
 
+  const waveformViewportDurationMs = useMemo(() => {
+    if (waveformViewport) return waveformViewport.endMs - waveformViewport.startMs;
+    if (typeof effectiveDurationMs === 'number') return effectiveDurationMs;
+    return null;
+  }, [effectiveDurationMs, waveformViewport]);
+
   useEffect(() => {
     shouldLoopTrimRef.current = shouldLoopTrim;
   }, [shouldLoopTrim]);
+
+  useEffect(() => {
+    waveformViewportRef.current = waveformViewport;
+  }, [waveformViewport]);
+
+  const commitWaveformViewportState = useCallback((next: { startMs: number; endMs: number }) => {
+    if (waveformViewportCommitTimerRef.current !== null) {
+      window.clearTimeout(waveformViewportCommitTimerRef.current);
+    }
+    waveformViewportCommitTimerRef.current = window.setTimeout(() => {
+      setWaveformViewport(next); // UI state는 드물게만 커밋
+      waveformViewportCommitTimerRef.current = null;
+    }, 80);
+  }, []);
+
+  const setWaveformViewportFast = useCallback(
+    (next: { startMs: number; endMs: number }) => {
+      waveformViewportRef.current = next;                 // ref를 진짜 source로 사용
+      renderOverviewWaveformRef.current?.();              // 즉시 캔버스 redraw
+      commitWaveformViewportState(next);                  // state는 디바운스 커밋
+    },
+    [commitWaveformViewportState],
+  );
+
+  useEffect(() => {
+    return () => {
+      if (waveformViewportCommitTimerRef.current !== null) {
+        window.clearTimeout(waveformViewportCommitTimerRef.current);
+        waveformViewportCommitTimerRef.current = null;
+      }
+    };
+  }, []);
+
+  const clampWaveformViewport = useCallback(
+    (startMs: number, durationMs: number): { startMs: number; endMs: number } | null => {
+      if (typeof effectiveDurationMs !== 'number' || effectiveDurationMs <= 0) return null;
+
+      const minDuration = Math.min(WAVEFORM_VIEWPORT_MIN_DURATION_MS, effectiveDurationMs);
+      const desiredDuration = Math.max(durationMs, minDuration);
+      const clampedDuration = Math.min(desiredDuration, effectiveDurationMs);
+
+      const safeStart = Number.isFinite(startMs) ? startMs : 0;
+      const clampedStart = Math.min(Math.max(safeStart, 0), effectiveDurationMs - clampedDuration);
+      const clampedEnd = clampedStart + clampedDuration;
+
+      return { startMs: clampedStart, endMs: clampedEnd };
+    },
+    [effectiveDurationMs],
+  );
+
+  useEffect(() => {
+    if (typeof effectiveDurationMs !== 'number' || effectiveDurationMs <= 0) {
+      setWaveformViewport(null);
+      return;
+    }
+
+    setWaveformViewport((prev) => {
+      const prevDuration = prev ? prev.endMs - prev.startMs : effectiveDurationMs;
+      return clampWaveformViewport(prev?.startMs ?? 0, prevDuration) ?? { startMs: 0, endMs: effectiveDurationMs };
+    });
+  }, [clampWaveformViewport, effectiveDurationMs]);
 
   useEffect(() => {
     normalizedTrimRangeRef.current = normalizedTrimRange;
@@ -1807,20 +1900,73 @@ export default function VideoDetailPage() {
   const xToMs = useCallback(
     (x: number, width: number) => {
       if (typeof effectiveDurationMs !== 'number' || effectiveDurationMs <= 0 || width <= 0) return null;
+      const viewportStartMs = waveformViewport?.startMs ?? 0;
+      const viewportDurationMs = waveformViewportDurationMs ?? effectiveDurationMs;
       const ratio = x / width;
-      const ms = ratio * effectiveDurationMs;
+      const ms = viewportStartMs + ratio * viewportDurationMs;
       return Math.min(Math.max(ms, 0), effectiveDurationMs);
     },
-    [effectiveDurationMs],
+    [effectiveDurationMs, waveformViewport?.startMs, waveformViewportDurationMs],
   );
 
   const msToX = useCallback(
     (ms: number, width: number) => {
       if (typeof effectiveDurationMs !== 'number' || effectiveDurationMs <= 0 || width <= 0) return null;
-      const clampedMs = Math.min(Math.max(ms, 0), effectiveDurationMs);
-      return (clampedMs / effectiveDurationMs) * width;
+      const viewportStartMs = waveformViewport?.startMs ?? 0;
+      const viewportDurationMs = waveformViewportDurationMs ?? effectiveDurationMs;
+      if (viewportDurationMs <= 0) return null;
+      const clampedMs = Math.min(Math.max(ms, viewportStartMs), viewportStartMs + viewportDurationMs);
+      return ((clampedMs - viewportStartMs) / viewportDurationMs) * width;
     },
-    [effectiveDurationMs],
+    [effectiveDurationMs, waveformViewport?.startMs, waveformViewportDurationMs],
+  );
+
+  const resetWaveformViewport = useCallback(() => {
+    if (typeof effectiveDurationMs !== 'number' || effectiveDurationMs <= 0) return;
+    const clamped = clampWaveformViewport(0, effectiveDurationMs);
+    if (clamped) setWaveformViewportFast(clamped);
+  }, [clampWaveformViewport, effectiveDurationMs, setWaveformViewportFast]);
+
+  const zoomWaveformViewport = useCallback(
+    (factor: number, anchorMs?: number | null) => {
+      if (typeof effectiveDurationMs !== 'number' || effectiveDurationMs <= 0) return;
+      if (!Number.isFinite(factor) || factor <= 0) return;
+
+      const current = waveformViewportRef.current ?? { startMs: 0, endMs: effectiveDurationMs };
+      const currentDuration = current.endMs - current.startMs;
+      if (!(currentDuration > 0)) return;
+
+      const targetDuration = currentDuration * factor;
+      const clampedAnchor = Number.isFinite(anchorMs)
+        ? Math.min(Math.max(anchorMs as number, 0), effectiveDurationMs)
+        : current.startMs + currentDuration / 2;
+
+      const anchorRatio = (clampedAnchor - current.startMs) / currentDuration;
+      const nextStart = clampedAnchor - anchorRatio * targetDuration;
+
+      const next = clampWaveformViewport(nextStart, targetDuration);
+      if (!next) return;
+      setWaveformViewportFast(next);
+    },
+    [clampWaveformViewport, effectiveDurationMs, setWaveformViewportFast],
+  );
+
+  const panWaveformViewport = useCallback(
+    (deltaPx: number, width: number) => {
+      if (typeof effectiveDurationMs !== 'number' || effectiveDurationMs <= 0) return;
+      if (!(width > 0)) return;
+      if (!Number.isFinite(deltaPx)) return;
+
+      const current = waveformViewportRef.current ?? { startMs: 0, endMs: effectiveDurationMs };
+      const durationMs = current.endMs - current.startMs;
+      if (!(durationMs > 0)) return;
+
+      const deltaMs = (deltaPx / width) * durationMs;
+      const next = clampWaveformViewport(current.startMs + deltaMs, durationMs);
+      if (!next) return;
+      setWaveformViewportFast(next);
+    },
+    [clampWaveformViewport, effectiveDurationMs, setWaveformViewportFast],
   );
 
   const seekToMs = useCallback(
@@ -1829,10 +1975,9 @@ export default function VideoDetailPage() {
       if (!videoElement) return;
       if (!Number.isFinite(ms)) return;
       videoElement.currentTime = ms / 1000;
-      currentTimeMsRef.current = ms;
-      setCurrentTimeMs(ms);
+      commitCurrentTimeMs(ms);
     },
-    [setCurrentTimeMs],
+    [commitCurrentTimeMs],
   );
 
   const handleWaveformPointerDown = useCallback(
@@ -1923,11 +2068,90 @@ export default function VideoDetailPage() {
     [seekToMs],
   );
 
+  const handleWaveformWheel = useCallback(
+    (event: WheelEvent) => {
+      const canvas = waveformCanvasRef.current;
+      if (!canvas) return;
+      if (typeof effectiveDurationMs !== 'number' || effectiveDurationMs <= 0) return;
+      if (waveformScrubPointerIdRef.current !== null) return;
+
+      const rect = canvas.getBoundingClientRect();
+      if (!(rect.width > 0)) return;
+
+      // 페이지 스크롤 방지(필수: passive:false로 붙여야 먹힘)
+      event.preventDefault();
+
+      const rawDelta = event.deltaY !== 0 ? event.deltaY : event.deltaX;
+      const deltaMode = event.deltaMode ?? 0; // 0=pixel, 1=line, 2=page
+      const linePx = 16;
+      const pagePx = rect.width;
+      const scaled =
+        deltaMode === 1 ? rawDelta * linePx : deltaMode === 2 ? rawDelta * pagePx : rawDelta;
+
+      const maxAbs = rect.width * 2;
+      const deltaPx = Math.max(-maxAbs, Math.min(maxAbs, scaled));
+
+      const nextType: 'zoom' | 'pan' = event.altKey ? 'zoom' : 'pan';
+      const anchorX = event.clientX - rect.left;
+
+      const prev = waveformPendingWheelRef.current;
+      if (prev && prev.type === nextType) {
+        prev.deltaPx += deltaPx;
+        prev.width = rect.width;
+        if (prev.type === 'zoom') (prev as { anchorX: number }).anchorX = anchorX;
+      } else {
+        waveformPendingWheelRef.current =
+          nextType === 'zoom'
+            ? { type: 'zoom', deltaPx, width: rect.width, anchorX }
+            : { type: 'pan', deltaPx, width: rect.width };
+      }
+
+      if (waveformWheelRafIdRef.current !== null) return;
+      waveformWheelRafIdRef.current = window.requestAnimationFrame(() => {
+        waveformWheelRafIdRef.current = null;
+        const pending = waveformPendingWheelRef.current;
+        waveformPendingWheelRef.current = null;
+        if (!pending) return;
+
+        if (pending.type === 'zoom') {
+          const anchorMs = xToMs(pending.anchorX, pending.width);
+          // 트랙패드/휠 둘 다 자연스럽게: 지수 스케일
+          const zoomFactor = Math.exp(pending.deltaPx * 0.001);
+          zoomWaveformViewport(zoomFactor, anchorMs);
+        } else {
+          panWaveformViewport(pending.deltaPx, pending.width);
+        }
+
+      });
+    },
+    [effectiveDurationMs, panWaveformViewport, xToMs, zoomWaveformViewport],
+  );
+
+  useEffect(() => {
+    const canvas = waveformCanvasRef.current;
+    if (!canvas) return;
+    const onWheel = (e: WheelEvent) => handleWaveformWheel(e);
+    canvas.addEventListener('wheel', onWheel, { passive: false });
+    return () => {
+      canvas.removeEventListener('wheel', onWheel);
+    };
+  }, [handleWaveformWheel]);
+
+  useEffect(() => {
+    return () => {
+      if (waveformWheelRafIdRef.current !== null) {
+        window.cancelAnimationFrame(waveformWheelRafIdRef.current);
+        waveformWheelRafIdRef.current = null;
+      }
+    };
+  }, []);
+
   const renderOverviewWaveform = useCallback(() => {
     const canvas = waveformCanvasRef.current;
     const peaks = waveformOverviewPeaksRef.current;
     const bucketCount = waveformBucketCountRef.current;
     if (!canvas) return;
+    if (typeof effectiveDurationMs !== 'number' || effectiveDurationMs <= 0) return;
 
     const context = canvas.getContext('2d');
     if (!context) return;
@@ -1945,16 +2169,29 @@ export default function VideoDetailPage() {
     if (!peaks || !bucketCount) return;
 
     const halfHeight = height / 2;
-    const barWidth = width / bucketCount;
+    const viewportStartMs = waveformViewportRef.current?.startMs ?? waveformViewport?.startMs ?? 0;
+    const viewportEndMs = waveformViewportRef.current?.endMs ?? waveformViewport?.endMs ?? effectiveDurationMs;
+    const viewportDurationMs = viewportEndMs - viewportStartMs;
+    if (viewportDurationMs <= 0) return;
+
+    const visibleBucketStart = (viewportStartMs / effectiveDurationMs) * bucketCount;
+    const visibleBucketEnd = (viewportEndMs / effectiveDurationMs) * bucketCount;
+    const visibleBucketRange = visibleBucketEnd - visibleBucketStart;
+    if (visibleBucketRange <= 0) return;
+
+    const barWidth = width / visibleBucketRange;
 
     context.lineWidth = Math.max(1, dpr);
     context.strokeStyle = '#2b7bff';
     context.beginPath();
 
-    for (let i = 0; i < bucketCount; i += 1) {
+    const startIndex = Math.max(0, Math.floor(visibleBucketStart));
+    const endIndex = Math.min(bucketCount, Math.ceil(visibleBucketEnd));
+
+    for (let i = startIndex; i < endIndex; i += 1) {
       const min = (peaks[i * 2] ?? 0) / 32768;
       const max = (peaks[i * 2 + 1] ?? 0) / 32767;
-      const x = i * barWidth;
+      const x = (i - visibleBucketStart) * barWidth;
       const yMin = halfHeight + min * halfHeight;
       const yMax = halfHeight + max * halfHeight;
       context.moveTo(x, yMin);
@@ -1975,7 +2212,11 @@ export default function VideoDetailPage() {
         context.stroke();
       }
     }
-  }, [effectiveDurationMs, msToX]);
+  }, [effectiveDurationMs, msToX, waveformViewport?.endMs, waveformViewport?.startMs]);
+
+  useEffect(() => {
+    renderOverviewWaveformRef.current = renderOverviewWaveform;
+  }, [renderOverviewWaveform]);
 
   const computeOverviewPeaks = useCallback(
     async (bucketCount: number) => {
@@ -3851,7 +4092,66 @@ export default function VideoDetailPage() {
                     border: '1px solid #e2e8f0',
                   }}
                 >
-                  <p style={{ margin: '0 0 8px', color: '#333', fontSize: 14 }}>오디오 파형</p>
+                  <div
+                    style={{
+                      display: 'flex',
+                      gap: 8,
+                      alignItems: 'center',
+                      justifyContent: 'space-between',
+                      marginBottom: 8,
+                    }}
+                  >
+                    <div style={{ color: '#333', fontSize: 14 }}>
+                      <p style={{ margin: 0, fontWeight: 600 }}>오디오 파형</p>
+                      <p style={{ margin: 0, fontSize: 12, color: '#475569' }}>
+                        Alt + 휠: 줌 · 휠: 이동
+                      </p>
+                    </div>
+                    <div style={{ display: 'flex', gap: 6 }}>
+                      <button
+                        type="button"
+                        onClick={() => zoomWaveformViewport(0.8)}
+                        disabled={typeof effectiveDurationMs !== 'number'}
+                        style={{
+                          padding: '6px 10px',
+                          borderRadius: 6,
+                          border: '1px solid #d0d7e2',
+                          background: '#fff',
+                          cursor: typeof effectiveDurationMs === 'number' ? 'pointer' : 'not-allowed',
+                        }}
+                      >
+                        +
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => zoomWaveformViewport(1.25)}
+                        disabled={typeof effectiveDurationMs !== 'number'}
+                        style={{
+                          padding: '6px 10px',
+                          borderRadius: 6,
+                          border: '1px solid #d0d7e2',
+                          background: '#fff',
+                          cursor: typeof effectiveDurationMs === 'number' ? 'pointer' : 'not-allowed',
+                        }}
+                      >
+                        -
+                      </button>
+                      <button
+                        type="button"
+                        onClick={resetWaveformViewport}
+                        disabled={typeof effectiveDurationMs !== 'number'}
+                        style={{
+                          padding: '6px 10px',
+                          borderRadius: 6,
+                          border: '1px solid #d0d7e2',
+                          background: '#fff',
+                          cursor: typeof effectiveDurationMs === 'number' ? 'pointer' : 'not-allowed',
+                        }}
+                      >
+                        Fit
+                      </button>
+                    </div>
+                  </div>
                   <canvas
                     ref={waveformCanvasRef}
                     onPointerDown={handleWaveformPointerDown}
@@ -3864,6 +4164,7 @@ export default function VideoDetailPage() {
                       display: 'block',
                       cursor: 'pointer',
                       touchAction: 'none',
+                      overscrollBehavior: 'contain',
                     }}
                   />
                 </div>
