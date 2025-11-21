@@ -102,6 +102,10 @@ const DEFAULT_HOTKEYS: HotkeyConfig = {
 
 const HOTKEY_STORAGE_KEY = 'caption_hotkeys';
 const WAVEFORM_VIEWPORT_MIN_DURATION_MS = 500;
+const WAVEFORM_MIN_BUCKET_COUNT = 64;
+const WAVEFORM_MAX_LOD_SCALE = 16;
+const WAVEFORM_PEAK_CACHE_LIMIT = 6;
+const WAVEFORM_MAX_BUCKET_COUNT = 131072;
 
 const WINDOW_KEYDOWN_CAPTURE_OPTS = { capture: true } as const;
 
@@ -312,6 +316,10 @@ export default function VideoDetailPage() {
   const waveformRequestIdRef = useRef(0);
   const waveformSamplesReadyRef = useRef(false);
   const waveformOverviewPeaksRef = useRef<Int16Array | null>(null);
+  const waveformPeaksCacheRef = useRef<Map<number, Int16Array>>(new Map());
+  const waveformStaticCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  const waveformStaticKeyRef = useRef<string | null>(null);
+  const waveformOverviewRenderRafIdRef = useRef<number | null>(null);
   const waveformBucketCountRef = useRef<number | null>(null);
   const waveformViewportRef = useRef<{ startMs: number; endMs: number } | null>(null);
   const waveformViewportCommitTimerRef = useRef<number | null>(null);
@@ -552,7 +560,7 @@ export default function VideoDetailPage() {
         // 숫자 입력은 "비우고 다시 타이핑"을 허용해야 함.
         // 빈값(NaN)인 동안은 자동 정렬로 값을 다시 채우지 않는다.
         if (!Number.isFinite(nextNumber)) return next;
-        return autoAlignCaptions(next, captionGapMs);return autoAlignCaptions(next, captionGapMs);
+        return autoAlignCaptions(next, captionGapMs);
       });
     },
     [captionGapMs, resetSaveCaptionsError],
@@ -1583,7 +1591,7 @@ export default function VideoDetailPage() {
   const setWaveformViewportFast = useCallback(
     (next: { startMs: number; endMs: number }) => {
       waveformViewportRef.current = next;                 // ref를 진짜 source로 사용
-      renderOverviewWaveformRef.current?.();              // 즉시 캔버스 redraw
+      renderOverviewWaveformRef.current?.();              // rAF로 캔버스 redraw
       commitWaveformViewportState(next);                  // state는 디바운스 커밋
     },
     [commitWaveformViewportState],
@@ -1879,6 +1887,8 @@ export default function VideoDetailPage() {
   const resetWaveformOverview = useCallback(() => {
     waveformSamplesReadyRef.current = false;
     waveformOverviewPeaksRef.current = null;
+    waveformPeaksCacheRef.current.clear();
+    waveformStaticKeyRef.current = null;
     waveformBucketCountRef.current = null;
     waveformPendingBucketRef.current = null;
     waveformLastComputeAtRef.current = 0;
@@ -1892,33 +1902,46 @@ export default function VideoDetailPage() {
   const getWaveformBucketCount = useCallback(() => {
     const canvas = waveformCanvasRef.current;
     if (!canvas) return null;
+    if (typeof effectiveDurationMs !== 'number' || effectiveDurationMs <= 0) return null;
+
+    const viewportStartMs = waveformViewportRef.current?.startMs ?? waveformViewport?.startMs ?? 0;
+    const viewportEndMs = waveformViewportRef.current?.endMs ?? waveformViewport?.endMs ?? effectiveDurationMs;
+    const viewportDurationMs = viewportEndMs - viewportStartMs;
+    if (!(viewportDurationMs > 0)) return null;
+
+    const zoomScale = Math.max(1, effectiveDurationMs / viewportDurationMs);
+    const lodScale = Math.min(WAVEFORM_MAX_LOD_SCALE, Math.pow(2, Math.ceil(Math.log2(zoomScale))));
     const dpr = window.devicePixelRatio || 1;
     const width = Math.max(1, Math.round(canvas.clientWidth * dpr));
-    return Math.max(64, width);
-  }, []);
+    const bucketCount = Math.max(WAVEFORM_MIN_BUCKET_COUNT, Math.round(width * lodScale));
+    return Math.min(WAVEFORM_MAX_BUCKET_COUNT, bucketCount);
+  }, [effectiveDurationMs, waveformViewport?.endMs, waveformViewport?.startMs]);
 
   const xToMs = useCallback(
     (x: number, width: number) => {
       if (typeof effectiveDurationMs !== 'number' || effectiveDurationMs <= 0 || width <= 0) return null;
-      const viewportStartMs = waveformViewport?.startMs ?? 0;
-      const viewportDurationMs = waveformViewportDurationMs ?? effectiveDurationMs;
+      const viewportStartMs = waveformViewportRef.current?.startMs ?? waveformViewport?.startMs ?? 0;
+      const viewportEndMs = waveformViewportRef.current?.endMs ?? waveformViewport?.endMs ?? effectiveDurationMs;
+      const viewportDurationMs = viewportEndMs - viewportStartMs;
+      if (!(viewportDurationMs > 0)) return null;
       const ratio = x / width;
       const ms = viewportStartMs + ratio * viewportDurationMs;
       return Math.min(Math.max(ms, 0), effectiveDurationMs);
     },
-    [effectiveDurationMs, waveformViewport?.startMs, waveformViewportDurationMs],
+    [effectiveDurationMs, waveformViewport?.endMs, waveformViewport?.startMs],
   );
 
   const msToX = useCallback(
     (ms: number, width: number) => {
       if (typeof effectiveDurationMs !== 'number' || effectiveDurationMs <= 0 || width <= 0) return null;
-      const viewportStartMs = waveformViewport?.startMs ?? 0;
-      const viewportDurationMs = waveformViewportDurationMs ?? effectiveDurationMs;
-      if (viewportDurationMs <= 0) return null;
-      const clampedMs = Math.min(Math.max(ms, viewportStartMs), viewportStartMs + viewportDurationMs);
+      const viewportStartMs = waveformViewportRef.current?.startMs ?? waveformViewport?.startMs ?? 0;
+      const viewportEndMs = waveformViewportRef.current?.endMs ?? waveformViewport?.endMs ?? effectiveDurationMs;
+      const viewportDurationMs = viewportEndMs - viewportStartMs;
+      if (!(viewportDurationMs > 0)) return null;
+      const clampedMs = Math.min(Math.max(ms, viewportStartMs), viewportEndMs);
       return ((clampedMs - viewportStartMs) / viewportDurationMs) * width;
     },
-    [effectiveDurationMs, waveformViewport?.startMs, waveformViewportDurationMs],
+    [effectiveDurationMs, waveformViewport?.endMs, waveformViewport?.startMs],
   );
 
   const resetWaveformViewport = useCallback(() => {
@@ -2137,19 +2160,8 @@ export default function VideoDetailPage() {
     };
   }, [handleWaveformWheel]);
 
-  useEffect(() => {
-    return () => {
-      if (waveformWheelRafIdRef.current !== null) {
-        window.cancelAnimationFrame(waveformWheelRafIdRef.current);
-        waveformWheelRafIdRef.current = null;
-      }
-    };
-  }, []);
-
-  const renderOverviewWaveform = useCallback(() => {
+  const renderOverviewWaveformNow = useCallback(() => {
     const canvas = waveformCanvasRef.current;
-    const peaks = waveformOverviewPeaksRef.current;
-    const bucketCount = waveformBucketCountRef.current;
     if (!canvas) return;
     if (typeof effectiveDurationMs !== 'number' || effectiveDurationMs <= 0) return;
 
@@ -2163,60 +2175,170 @@ export default function VideoDetailPage() {
     if (canvas.width !== width || canvas.height !== height) {
       canvas.width = width;
       canvas.height = height;
+      waveformStaticKeyRef.current = null;
     }
 
-    context.clearRect(0, 0, width, height);
-    if (!peaks || !bucketCount) return;
+    // offscreen(메모리) 캔버스에 "파형(정적)"을 그려두고,
+    // 메인 캔버스에서는 drawImage + 플레이헤드만 그린다.
+    let staticCanvas = waveformStaticCanvasRef.current;
+    if (!staticCanvas) {
+      if (typeof document === 'undefined') return;
+      staticCanvas = document.createElement('canvas');
+      waveformStaticCanvasRef.current = staticCanvas;
+    }
+    if (staticCanvas.width !== width || staticCanvas.height !== height) {
+      staticCanvas.width = width;
+      staticCanvas.height = height;
+      waveformStaticKeyRef.current = null;
+    }
 
-    const halfHeight = height / 2;
+    const peaks = waveformOverviewPeaksRef.current;
+    const bucketCount = waveformBucketCountRef.current;
+
     const viewportStartMs = waveformViewportRef.current?.startMs ?? waveformViewport?.startMs ?? 0;
     const viewportEndMs = waveformViewportRef.current?.endMs ?? waveformViewport?.endMs ?? effectiveDurationMs;
     const viewportDurationMs = viewportEndMs - viewportStartMs;
-    if (viewportDurationMs <= 0) return;
+    if (!(viewportDurationMs > 0)) return;
 
-    const visibleBucketStart = (viewportStartMs / effectiveDurationMs) * bucketCount;
-    const visibleBucketEnd = (viewportEndMs / effectiveDurationMs) * bucketCount;
-    const visibleBucketRange = visibleBucketEnd - visibleBucketStart;
-    if (visibleBucketRange <= 0) return;
+    const hasValidPeaks = Boolean(peaks && bucketCount && bucketCount > 0);
 
-    const barWidth = width / visibleBucketRange;
+    if (hasValidPeaks) {
+      const key = `${width}x${height}|b=${bucketCount}|v=${Math.round(viewportStartMs)}-${Math.round(viewportEndMs)}`;
+      if (waveformStaticKeyRef.current !== key) {
+        const staticCtx = staticCanvas.getContext('2d');
+        if (!staticCtx) return;
 
-    context.lineWidth = Math.max(1, dpr);
-    context.strokeStyle = '#2b7bff';
-    context.beginPath();
+        staticCtx.clearRect(0, 0, width, height);
 
-    const startIndex = Math.max(0, Math.floor(visibleBucketStart));
-    const endIndex = Math.min(bucketCount, Math.ceil(visibleBucketEnd));
+        const halfHeight = height / 2;
+        const safeBucketCount = bucketCount as number;
+        const safePeaks = peaks as Int16Array;
 
-    for (let i = startIndex; i < endIndex; i += 1) {
-      const min = (peaks[i * 2] ?? 0) / 32768;
-      const max = (peaks[i * 2 + 1] ?? 0) / 32767;
-      const x = (i - visibleBucketStart) * barWidth;
-      const yMin = halfHeight + min * halfHeight;
-      const yMax = halfHeight + max * halfHeight;
-      context.moveTo(x, yMin);
-      context.lineTo(x, yMax);
+        // viewport slice만 그리기 + O(width) 샘플링(=프레임 비용 고정)
+        const visibleBucketStart = (viewportStartMs / effectiveDurationMs) * safeBucketCount;
+        const visibleBucketEnd = (viewportEndMs / effectiveDurationMs) * safeBucketCount;
+        const visibleBucketRange = visibleBucketEnd - visibleBucketStart;
+        if (visibleBucketRange > 0) {
+          staticCtx.lineWidth = 1;
+          staticCtx.strokeStyle = '#2b7bff';
+          staticCtx.beginPath();
+
+          const denom = width <= 1 ? 1 : width - 1;
+          for (let x = 0; x < width; x += 1) {
+            const t = x / denom;
+            const bucket = Math.min(
+              safeBucketCount - 1,
+              Math.max(0, Math.floor(visibleBucketStart + t * visibleBucketRange)),
+            );
+            const min = (safePeaks[bucket * 2] ?? 0) / 32768;
+            const max = (safePeaks[bucket * 2 + 1] ?? 0) / 32767;
+
+            const xPos = x + 0.5;
+            const yMin = halfHeight + min * halfHeight;
+            const yMax = halfHeight + max * halfHeight;
+            staticCtx.moveTo(xPos, yMin);
+            staticCtx.lineTo(xPos, yMax);
+          }
+
+          staticCtx.stroke();
+        }
+
+        waveformStaticKeyRef.current = key;
+      }
     }
 
-    context.stroke();
+    // peaks 준비 전/교체 중에도 "빈 프레임"을 만들지 않기 위해:
+    // - 캐시된 정적 캔버스가 있으면 그대로 blit
+    // - 없으면 그때만 clear
+    if (waveformStaticKeyRef.current) {
+      context.drawImage(staticCanvas, 0, 0);
+    } else {
+      context.clearRect(0, 0, width, height);
+    }
 
-    if (typeof currentTimeMsRef.current === 'number' && typeof effectiveDurationMs === 'number' && effectiveDurationMs > 0) {
-      const clampedMs = Math.min(Math.max(currentTimeMsRef.current, 0), effectiveDurationMs);
-      const x = msToX(clampedMs, width);
-      if (typeof x === 'number') {
+    // 플레이헤드는 매 프레임 덧그리기(정적 파형을 다시 계산하지 않음)
+    const currentMs = currentTimeMsRef.current;
+    if (typeof currentMs === 'number') {
+      const clampedMs = Math.min(Math.max(currentMs, 0), effectiveDurationMs);
+      const ratio = (clampedMs - viewportStartMs) / viewportDurationMs;
+      const x = ratio * width;
+      if (Number.isFinite(x)) {
         context.strokeStyle = '#ef4444';
-        context.lineWidth = Math.max(1, dpr * 1.2);
+        context.lineWidth = 1;
         context.beginPath();
-        context.moveTo(x, 0);
-        context.lineTo(x, height);
+        context.moveTo(x + 0.5, 0);
+        context.lineTo(x + 0.5, height);
         context.stroke();
       }
     }
-  }, [effectiveDurationMs, msToX, waveformViewport?.endMs, waveformViewport?.startMs]);
+  }, [effectiveDurationMs, waveformViewport?.endMs, waveformViewport?.startMs]);
+
+  const scheduleRenderOverviewWaveform = useCallback(() => {
+    if (waveformOverviewRenderRafIdRef.current !== null) return;
+    waveformOverviewRenderRafIdRef.current = window.requestAnimationFrame(() => {
+      waveformOverviewRenderRafIdRef.current = null;
+      renderOverviewWaveformNow();
+    });
+  }, [renderOverviewWaveformNow]);
 
   useEffect(() => {
-    renderOverviewWaveformRef.current = renderOverviewWaveform;
-  }, [renderOverviewWaveform]);
+    return () => {
+      if (waveformWheelRafIdRef.current !== null) {
+        window.cancelAnimationFrame(waveformWheelRafIdRef.current);
+        waveformWheelRafIdRef.current = null;
+      }
+      if (waveformOverviewRenderRafIdRef.current !== null) {
+        window.cancelAnimationFrame(waveformOverviewRenderRafIdRef.current);
+        waveformOverviewRenderRafIdRef.current = null;
+      }
+    };
+  }, []);
+
+  useEffect(() => {
+    renderOverviewWaveformRef.current = scheduleRenderOverviewWaveform;
+  }, [scheduleRenderOverviewWaveform]);
+
+  const applyCachedWaveformPeaks = useCallback(
+    (bucketCount: number) => {
+      const cache = waveformPeaksCacheRef.current;
+      const cached = cache.get(bucketCount);
+      if (!cached) return false;
+
+      cache.delete(bucketCount);
+      cache.set(bucketCount, cached);
+      waveformOverviewPeaksRef.current = cached;
+      waveformBucketCountRef.current = bucketCount;
+      waveformLastComputeAtRef.current = Date.now();
+      waveformPendingBucketRef.current = null;
+      if (import.meta.env.DEV) {
+        console.debug(`[waveform] peaks cache hit (bucketCount=${bucketCount}, entries=${cache.size})`);
+      }
+      scheduleRenderOverviewWaveform();
+      return true;
+    },
+    [scheduleRenderOverviewWaveform],
+  );
+
+  const storeWaveformPeaks = useCallback(
+    (bucketCount: number, peaks: Int16Array) => {
+      const cache = waveformPeaksCacheRef.current;
+      cache.set(bucketCount, peaks);
+      if (cache.size > WAVEFORM_PEAK_CACHE_LIMIT) {
+        const oldest = cache.keys().next();
+        if (!oldest.done) cache.delete(oldest.value);
+      }
+      if (import.meta.env.DEV) {
+        console.debug(`[waveform] peaks cached (bucketCount=${bucketCount}, entries=${cache.size})`);
+      }
+
+      waveformOverviewPeaksRef.current = peaks;
+      waveformBucketCountRef.current = bucketCount;
+      waveformLastComputeAtRef.current = Date.now();
+      waveformPendingBucketRef.current = null;
+      scheduleRenderOverviewWaveform();
+    },
+    [scheduleRenderOverviewWaveform],
+  );
 
   const computeOverviewPeaks = useCallback(
     async (bucketCount: number) => {
@@ -2227,10 +2349,8 @@ export default function VideoDetailPage() {
         if (response.type !== 'peaks-ready') return;
         if (token !== waveformComputeTokenRef.current) return;
 
-        waveformOverviewPeaksRef.current = new Int16Array(response.peaks);
-        waveformBucketCountRef.current = response.bucketCount;
-        waveformLastComputeAtRef.current = Date.now();
-        waveformPendingBucketRef.current = null;
+        const peaks = new Int16Array(response.peaks);
+        storeWaveformPeaks(response.bucketCount, peaks);
 
         if (import.meta.env.DEV) {
           console.debug(
@@ -2238,19 +2358,20 @@ export default function VideoDetailPage() {
           );
         }
 
-        renderOverviewWaveform();
       } catch (error) {
         console.error('[waveform] peak computation failed', error);
         setShouldUseLiveWaveform(true);
         waveformModeRef.current = 'live';
       }
     },
-    [postWaveformWorkerMessage, renderOverviewWaveform],
+    [postWaveformWorkerMessage, storeWaveformPeaks],
   );
 
   const queueWaveformComputation = useCallback(
     (bucketCount: number | null) => {
       if (!bucketCount || bucketCount <= 0 || shouldUseLiveWaveform) return;
+
+      if (applyCachedWaveformPeaks(bucketCount)) return;
 
       waveformPendingBucketRef.current = bucketCount;
 
@@ -2260,7 +2381,7 @@ export default function VideoDetailPage() {
 
       const now = Date.now();
       if (waveformBucketCountRef.current === bucketCount && now - waveformLastComputeAtRef.current < 1000) {
-        renderOverviewWaveform();
+        scheduleRenderOverviewWaveform();
         return;
       }
 
@@ -2275,7 +2396,7 @@ export default function VideoDetailPage() {
         void computeOverviewPeaks(pendingBucketCount);
       }, delay);
     },
-    [computeOverviewPeaks, renderOverviewWaveform, shouldUseLiveWaveform],
+    [applyCachedWaveformPeaks, computeOverviewPeaks, scheduleRenderOverviewWaveform, shouldUseLiveWaveform],
   );
 
   useEffect(() => {
@@ -2366,7 +2487,7 @@ export default function VideoDetailPage() {
       if (bucketCount && bucketCount !== waveformBucketCountRef.current) {
         queueWaveformComputation(bucketCount);
       }
-      renderOverviewWaveform();
+      scheduleRenderOverviewWaveform();
     };
 
     const observer = typeof ResizeObserver !== 'undefined' ? new ResizeObserver(handleResize) : null;
@@ -2383,12 +2504,25 @@ export default function VideoDetailPage() {
         waveformComputeTimeoutRef.current = null;
       }
     };
-  }, [getWaveformBucketCount, queueWaveformComputation, renderOverviewWaveform, shouldUseLiveWaveform]);
+  }, [getWaveformBucketCount, queueWaveformComputation, scheduleRenderOverviewWaveform, shouldUseLiveWaveform]);
 
   useEffect(() => {
     if (shouldUseLiveWaveform) return;
-    renderOverviewWaveform();
-  }, [renderOverviewWaveform, shouldUseLiveWaveform, currentTimeMs]);
+    const bucketCount = getWaveformBucketCount();
+    queueWaveformComputation(bucketCount);
+  }, [
+    getWaveformBucketCount,
+    queueWaveformComputation,
+    shouldUseLiveWaveform,
+    waveformViewport?.endMs,
+    waveformViewport?.startMs,
+    waveformViewportDurationMs,
+  ]);
+
+  useEffect(() => {
+    if (shouldUseLiveWaveform) return;
+    scheduleRenderOverviewWaveform();
+  }, [scheduleRenderOverviewWaveform, shouldUseLiveWaveform, currentTimeMs]);
 
   const drawWaveform = useCallback(() => {
     const canvas = waveformCanvasRef.current;
