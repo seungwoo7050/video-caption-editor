@@ -106,6 +106,9 @@ const WAVEFORM_MIN_BUCKET_COUNT = 64;
 const WAVEFORM_MAX_LOD_SCALE = 16;
 const WAVEFORM_PEAK_CACHE_LIMIT = 6;
 const WAVEFORM_MAX_BUCKET_COUNT = 131072;
+const WAVEFORM_RASTER_CACHE_LIMIT = 4;
+const WAVEFORM_PLAYHEAD_RATIO = 0.5;
+const WAVEFORM_FOLLOW_RESUME_MS = 1800;
 
 const WINDOW_KEYDOWN_CAPTURE_OPTS = { capture: true } as const;
 
@@ -317,8 +320,9 @@ export default function VideoDetailPage() {
   const waveformSamplesReadyRef = useRef(false);
   const waveformOverviewPeaksRef = useRef<Int16Array | null>(null);
   const waveformPeaksCacheRef = useRef<Map<number, Int16Array>>(new Map());
-  const waveformStaticCanvasRef = useRef<HTMLCanvasElement | null>(null);
-  const waveformStaticKeyRef = useRef<string | null>(null);
+  const waveformRasterCacheRef = useRef<Map<string, OffscreenCanvas | HTMLCanvasElement>>(new Map());
+  const waveformRasterKeyRef = useRef<string | null>(null);
+  const waveformRasterHeightRef = useRef<number>(0);
   const waveformOverviewRenderRafIdRef = useRef<number | null>(null);
   const waveformBucketCountRef = useRef<number | null>(null);
   const waveformViewportRef = useRef<{ startMs: number; endMs: number } | null>(null);
@@ -354,6 +358,9 @@ export default function VideoDetailPage() {
   const waveformScrubPointerIdRef = useRef<number | null>(null);
   const waveformScrubRafIdRef = useRef<number | null>(null);
   const waveformPendingSeekMsRef = useRef<number | null>(null);
+  const waveformFollowEnabledRef = useRef(true);
+  const waveformFollowPausedRef = useRef(false);
+  const waveformFollowResumeTimeoutRef = useRef<number | null>(null);
   const shouldLoopTrimRef = useRef(false);
   const normalizedTrimRangeRef = useRef<ReturnType<typeof normalizeTrimRange>>(null);
   const captionRefs = useRef<Record<string, HTMLLIElement | null>>({});
@@ -1884,11 +1891,17 @@ export default function VideoDetailPage() {
     [],
   );
 
+  const clearWaveformRasterCache = useCallback(() => {
+    waveformRasterCacheRef.current.clear();
+    waveformRasterKeyRef.current = null;
+    waveformRasterHeightRef.current = 0;
+  }, []);
+
   const resetWaveformOverview = useCallback(() => {
     waveformSamplesReadyRef.current = false;
     waveformOverviewPeaksRef.current = null;
     waveformPeaksCacheRef.current.clear();
-    waveformStaticKeyRef.current = null;
+    clearWaveformRasterCache();
     waveformBucketCountRef.current = null;
     waveformPendingBucketRef.current = null;
     waveformLastComputeAtRef.current = 0;
@@ -1897,7 +1910,7 @@ export default function VideoDetailPage() {
       window.clearTimeout(waveformComputeTimeoutRef.current);
       waveformComputeTimeoutRef.current = null;
     }
-  }, []);
+  }, [clearWaveformRasterCache]);
 
   const getWaveformBucketCount = useCallback(() => {
     const canvas = waveformCanvasRef.current;
@@ -1916,6 +1929,92 @@ export default function VideoDetailPage() {
     const bucketCount = Math.max(WAVEFORM_MIN_BUCKET_COUNT, Math.round(width * lodScale));
     return Math.min(WAVEFORM_MAX_BUCKET_COUNT, bucketCount);
   }, [effectiveDurationMs, waveformViewport?.endMs, waveformViewport?.startMs]);
+
+  const touchWaveformRasterCache = useCallback((key: string, canvas: OffscreenCanvas | HTMLCanvasElement) => {
+    const cache = waveformRasterCacheRef.current;
+    cache.delete(key);
+    cache.set(key, canvas);
+    if (cache.size > WAVEFORM_RASTER_CACHE_LIMIT) {
+      const oldest = cache.keys().next();
+      if (!oldest.done) cache.delete(oldest.value);
+    }
+  }, []);
+
+  const getWaveformRasterKey = useCallback(
+    (bucketCount: number, height: number, dpr: number) => `${bucketCount}|${height}|${Math.round(dpr * 100)}`,
+    [],
+  );
+
+  const createWaveformRasterCanvas = useCallback((width: number, height: number) => {
+    if (typeof OffscreenCanvas !== 'undefined') {
+      return new OffscreenCanvas(width, height);
+    }
+    const canvas = document.createElement('canvas');
+    canvas.width = width;
+    canvas.height = height;
+    return canvas;
+  }, []);
+
+  const rasterizeWaveform = useCallback(
+    (bucketCount: number, peaks: Int16Array, height: number) => {
+      const width = Math.max(1, bucketCount);
+      const rasterCanvas = createWaveformRasterCanvas(width, height);
+      const context = rasterCanvas.getContext('2d');
+      if (!context) return null;
+
+      context.clearRect(0, 0, width, height);
+      context.lineWidth = 1;
+      context.strokeStyle = '#2b7bff';
+
+      const halfHeight = height / 2;
+      context.beginPath();
+      for (let bucket = 0; bucket < bucketCount; bucket += 1) {
+        const min = (peaks[bucket * 2] ?? 0) / 32768;
+        const max = (peaks[bucket * 2 + 1] ?? 0) / 32767;
+        const x = bucket + 0.5;
+        const yMin = halfHeight + min * halfHeight;
+        const yMax = halfHeight + max * halfHeight;
+        context.moveTo(x, yMin);
+        context.lineTo(x, yMax);
+      }
+      context.stroke();
+
+      return rasterCanvas;
+    },
+    [createWaveformRasterCanvas],
+  );
+
+  const primeWaveformRaster = useCallback(
+    (bucketCount: number, peaks: Int16Array) => {
+      const canvas = waveformCanvasRef.current;
+      const dpr = window.devicePixelRatio || 1;
+      const targetHeight = canvas && canvas.clientHeight > 0
+        ? Math.max(1, Math.round(canvas.clientHeight * dpr))
+        : waveformRasterHeightRef.current;
+      if (!targetHeight) return;
+
+      const key = getWaveformRasterKey(bucketCount, targetHeight, dpr);
+      const cache = waveformRasterCacheRef.current;
+      const cached = cache.get(key);
+      if (cached) {
+        touchWaveformRasterCache(key, cached);
+        waveformRasterKeyRef.current = key;
+        if (import.meta.env.DEV) {
+          console.debug(`[waveform] raster cache hit (key=${key}, entries=${cache.size})`);
+        }
+        return;
+      }if (cache.has(key)) return;
+
+      const raster = rasterizeWaveform(bucketCount, peaks, targetHeight);
+      if (!raster) return;
+      touchWaveformRasterCache(key, raster);
+      waveformRasterKeyRef.current = key;
+      if (import.meta.env.DEV) {
+        console.debug(`[waveform] raster cached (key=${key}, entries=${cache.size})`);
+      }
+    },
+    [getWaveformRasterKey, rasterizeWaveform, touchWaveformRasterCache],
+  );
 
   const xToMs = useCallback(
     (x: number, width: number) => {
@@ -1950,6 +2049,24 @@ export default function VideoDetailPage() {
     if (clamped) setWaveformViewportFast(clamped);
   }, [clampWaveformViewport, effectiveDurationMs, setWaveformViewportFast]);
 
+  const cancelWaveformFollowResume = useCallback(() => {
+    if (waveformFollowResumeTimeoutRef.current !== null) {
+      window.clearTimeout(waveformFollowResumeTimeoutRef.current);
+      waveformFollowResumeTimeoutRef.current = null;
+    }
+  }, []);
+
+  const pauseWaveformFollow = useCallback(
+    (durationMs = WAVEFORM_FOLLOW_RESUME_MS) => {
+      waveformFollowPausedRef.current = true;
+      cancelWaveformFollowResume();
+      waveformFollowResumeTimeoutRef.current = window.setTimeout(() => {
+        waveformFollowPausedRef.current = false;
+      }, durationMs);
+    },
+    [cancelWaveformFollowResume],
+  );
+
   const zoomWaveformViewport = useCallback(
     (factor: number, anchorMs?: number | null) => {
       if (typeof effectiveDurationMs !== 'number' || effectiveDurationMs <= 0) return;
@@ -1979,6 +2096,7 @@ export default function VideoDetailPage() {
       if (typeof effectiveDurationMs !== 'number' || effectiveDurationMs <= 0) return;
       if (!(width > 0)) return;
       if (!Number.isFinite(deltaPx)) return;
+      pauseWaveformFollow();
 
       const current = waveformViewportRef.current ?? { startMs: 0, endMs: effectiveDurationMs };
       const durationMs = current.endMs - current.startMs;
@@ -1989,8 +2107,53 @@ export default function VideoDetailPage() {
       if (!next) return;
       setWaveformViewportFast(next);
     },
-    [clampWaveformViewport, effectiveDurationMs, setWaveformViewportFast],
+    [clampWaveformViewport, effectiveDurationMs, pauseWaveformFollow, setWaveformViewportFast],
   );
+
+  const isWaveformFollowActive = useCallback(() => {
+    if (!waveformFollowEnabledRef.current || waveformFollowPausedRef.current) return false;
+    if (typeof effectiveDurationMs !== 'number' || effectiveDurationMs <= 0) return false;
+    const viewport = waveformViewportRef.current ?? { startMs: 0, endMs: effectiveDurationMs };
+    const viewportDuration = viewport.endMs - viewport.startMs;
+    if (!(viewportDuration > 0)) return false;
+    return viewportDuration < effectiveDurationMs;
+  }, [effectiveDurationMs]);
+
+  const recenterWaveformViewport = useCallback(
+    (ms: number) => {
+      if (!isWaveformFollowActive()) return;
+      if (typeof effectiveDurationMs !== 'number' || effectiveDurationMs <= 0) return;
+
+      const current = waveformViewportRef.current ?? { startMs: 0, endMs: effectiveDurationMs };
+      const viewportDuration = current.endMs - current.startMs;
+      if (!(viewportDuration > 0)) return;
+
+      const desiredStart = ms - viewportDuration * WAVEFORM_PLAYHEAD_RATIO;
+      const next = clampWaveformViewport(desiredStart, viewportDuration);
+      if (!next) return;
+
+      if (
+        Math.abs(next.startMs - current.startMs) < 0.1 &&
+        Math.abs(next.endMs - current.endMs) < 0.1
+      ) {
+        return;
+      }
+
+      setWaveformViewportFast(next);
+    },
+    [clampWaveformViewport, effectiveDurationMs, isWaveformFollowActive, setWaveformViewportFast],
+  );
+
+  useEffect(() => {
+    if (typeof currentTimeMs !== 'number') return;
+    recenterWaveformViewport(currentTimeMs);
+  }, [currentTimeMs, recenterWaveformViewport]);
+
+  useEffect(() => {
+    return () => {
+      cancelWaveformFollowResume();
+    };
+  }, [cancelWaveformFollowResume]);
 
   const seekToMs = useCallback(
     (ms: number) => {
@@ -1999,8 +2162,9 @@ export default function VideoDetailPage() {
       if (!Number.isFinite(ms)) return;
       videoElement.currentTime = ms / 1000;
       commitCurrentTimeMs(ms);
+      recenterWaveformViewport(ms);
     },
-    [commitCurrentTimeMs],
+    [commitCurrentTimeMs, recenterWaveformViewport],
   );
 
   const handleWaveformPointerDown = useCallback(
@@ -2044,6 +2208,7 @@ export default function VideoDetailPage() {
       if (!canvas) return;
 
       event.preventDefault();
+      pauseWaveformFollow();
 
       const rect = canvas.getBoundingClientRect();
       if (rect.width <= 0) return;
@@ -2060,7 +2225,7 @@ export default function VideoDetailPage() {
         if (typeof pending === 'number') seekToMs(pending);
       });
     },
-    [seekToMs, xToMs],
+    [pauseWaveformFollow, seekToMs, xToMs],
   );
 
   const handleWaveformPointerUp = useCallback(
@@ -2103,6 +2268,7 @@ export default function VideoDetailPage() {
 
       // 페이지 스크롤 방지(필수: passive:false로 붙여야 먹힘)
       event.preventDefault();
+      pauseWaveformFollow();
 
       const rawDelta = event.deltaY !== 0 ? event.deltaY : event.deltaX;
       const deltaMode = event.deltaMode ?? 0; // 0=pixel, 1=line, 2=page
@@ -2147,7 +2313,7 @@ export default function VideoDetailPage() {
 
       });
     },
-    [effectiveDurationMs, panWaveformViewport, xToMs, zoomWaveformViewport],
+    [effectiveDurationMs, panWaveformViewport, pauseWaveformFollow, xToMs, zoomWaveformViewport],
   );
 
   useEffect(() => {
@@ -2175,22 +2341,9 @@ export default function VideoDetailPage() {
     if (canvas.width !== width || canvas.height !== height) {
       canvas.width = width;
       canvas.height = height;
-      waveformStaticKeyRef.current = null;
     }
 
-    // offscreen(메모리) 캔버스에 "파형(정적)"을 그려두고,
-    // 메인 캔버스에서는 drawImage + 플레이헤드만 그린다.
-    let staticCanvas = waveformStaticCanvasRef.current;
-    if (!staticCanvas) {
-      if (typeof document === 'undefined') return;
-      staticCanvas = document.createElement('canvas');
-      waveformStaticCanvasRef.current = staticCanvas;
-    }
-    if (staticCanvas.width !== width || staticCanvas.height !== height) {
-      staticCanvas.width = width;
-      staticCanvas.height = height;
-      waveformStaticKeyRef.current = null;
-    }
+    waveformRasterHeightRef.current = height;
 
     const peaks = waveformOverviewPeaksRef.current;
     const bucketCount = waveformBucketCountRef.current;
@@ -2200,78 +2353,79 @@ export default function VideoDetailPage() {
     const viewportDurationMs = viewportEndMs - viewportStartMs;
     if (!(viewportDurationMs > 0)) return;
 
-    const hasValidPeaks = Boolean(peaks && bucketCount && bucketCount > 0);
+    const cache = waveformRasterCacheRef.current;
+    const targetKey = bucketCount && bucketCount > 0 ? getWaveformRasterKey(bucketCount, height, dpr) : null;
 
-    if (hasValidPeaks) {
-      const key = `${width}x${height}|b=${bucketCount}|v=${Math.round(viewportStartMs)}-${Math.round(viewportEndMs)}`;
-      if (waveformStaticKeyRef.current !== key) {
-        const staticCtx = staticCanvas.getContext('2d');
-        if (!staticCtx) return;
+    let rasterCanvas: OffscreenCanvas | HTMLCanvasElement | null = null;
 
-        staticCtx.clearRect(0, 0, width, height);
-
-        const halfHeight = height / 2;
-        const safeBucketCount = bucketCount as number;
-        const safePeaks = peaks as Int16Array;
-
-        // viewport slice만 그리기 + O(width) 샘플링(=프레임 비용 고정)
-        const visibleBucketStart = (viewportStartMs / effectiveDurationMs) * safeBucketCount;
-        const visibleBucketEnd = (viewportEndMs / effectiveDurationMs) * safeBucketCount;
-        const visibleBucketRange = visibleBucketEnd - visibleBucketStart;
-        if (visibleBucketRange > 0) {
-          staticCtx.lineWidth = 1;
-          staticCtx.strokeStyle = '#2b7bff';
-          staticCtx.beginPath();
-
-          const denom = width <= 1 ? 1 : width - 1;
-          for (let x = 0; x < width; x += 1) {
-            const t = x / denom;
-            const bucket = Math.min(
-              safeBucketCount - 1,
-              Math.max(0, Math.floor(visibleBucketStart + t * visibleBucketRange)),
-            );
-            const min = (safePeaks[bucket * 2] ?? 0) / 32768;
-            const max = (safePeaks[bucket * 2 + 1] ?? 0) / 32767;
-
-            const xPos = x + 0.5;
-            const yMin = halfHeight + min * halfHeight;
-            const yMax = halfHeight + max * halfHeight;
-            staticCtx.moveTo(xPos, yMin);
-            staticCtx.lineTo(xPos, yMax);
-          }
-
-          staticCtx.stroke();
-        }
-
-        waveformStaticKeyRef.current = key;
+    if (targetKey) {
+      const cached = cache.get(targetKey) ?? null;
+      if (cached) {
+        touchWaveformRasterCache(targetKey, cached);
+        waveformRasterKeyRef.current = targetKey;
+        rasterCanvas = cached;
       }
     }
 
-    // peaks 준비 전/교체 중에도 "빈 프레임"을 만들지 않기 위해:
-    // - 캐시된 정적 캔버스가 있으면 그대로 blit
-    // - 없으면 그때만 clear
-    if (waveformStaticKeyRef.current) {
-      context.drawImage(staticCanvas, 0, 0);
-    } else {
-      context.clearRect(0, 0, width, height);
+    if (!rasterCanvas && peaks && bucketCount && targetKey) {
+      const generated = rasterizeWaveform(bucketCount, peaks, height);
+      if (generated) {
+        touchWaveformRasterCache(targetKey, generated);
+        waveformRasterKeyRef.current = targetKey;
+        rasterCanvas = generated;
+      }
     }
 
-    // 플레이헤드는 매 프레임 덧그리기(정적 파형을 다시 계산하지 않음)
+    if (!rasterCanvas && waveformRasterKeyRef.current) {
+      rasterCanvas = cache.get(waveformRasterKeyRef.current) ?? null;
+    }
+
+    context.clearRect(0, 0, width, height);
+
+    if (rasterCanvas) {
+      const rasterWidth = Math.max(1, rasterCanvas.width);
+      const sourceStartX = (viewportStartMs / effectiveDurationMs) * rasterWidth;
+      const sourceWidth = (viewportDurationMs / effectiveDurationMs) * rasterWidth;
+      const maxStart = Math.max(0, rasterWidth - 1);
+      const clampedStart = Math.max(0, Math.min(maxStart, sourceStartX));
+      const maxWidth = rasterWidth - clampedStart;
+      const clampedWidth = Math.max(1, Math.min(maxWidth, sourceWidth));
+
+      context.drawImage(
+        rasterCanvas,
+        clampedStart,
+        0,
+        clampedWidth,
+        rasterCanvas.height,
+        0,
+        0,
+        width,
+        height,
+      );
+    }
+
     const currentMs = currentTimeMsRef.current;
     if (typeof currentMs === 'number') {
-      const clampedMs = Math.min(Math.max(currentMs, 0), effectiveDurationMs);
-      const ratio = (clampedMs - viewportStartMs) / viewportDurationMs;
-      const x = ratio * width;
-      if (Number.isFinite(x)) {
+      const x = msToX(currentMs, width);
+      if (typeof x === 'number') {
         context.strokeStyle = '#ef4444';
         context.lineWidth = 1;
         context.beginPath();
-        context.moveTo(x + 0.5, 0);
-        context.lineTo(x + 0.5, height);
+        const alignedX = x + 0.5;
+        context.moveTo(alignedX, 0);
+        context.lineTo(alignedX, height);
         context.stroke();
       }
     }
-  }, [effectiveDurationMs, waveformViewport?.endMs, waveformViewport?.startMs]);
+  }, [
+    effectiveDurationMs,
+    getWaveformRasterKey,
+    msToX,
+    rasterizeWaveform,
+    touchWaveformRasterCache,
+    waveformViewport?.endMs,
+    waveformViewport?.startMs,
+  ]);
 
   const scheduleRenderOverviewWaveform = useCallback(() => {
     if (waveformOverviewRenderRafIdRef.current !== null) return;
@@ -2310,13 +2464,14 @@ export default function VideoDetailPage() {
       waveformBucketCountRef.current = bucketCount;
       waveformLastComputeAtRef.current = Date.now();
       waveformPendingBucketRef.current = null;
+      primeWaveformRaster(bucketCount, cached);
       if (import.meta.env.DEV) {
         console.debug(`[waveform] peaks cache hit (bucketCount=${bucketCount}, entries=${cache.size})`);
       }
       scheduleRenderOverviewWaveform();
       return true;
     },
-    [scheduleRenderOverviewWaveform],
+    [primeWaveformRaster, scheduleRenderOverviewWaveform],
   );
 
   const storeWaveformPeaks = useCallback(
@@ -2335,9 +2490,10 @@ export default function VideoDetailPage() {
       waveformBucketCountRef.current = bucketCount;
       waveformLastComputeAtRef.current = Date.now();
       waveformPendingBucketRef.current = null;
+      primeWaveformRaster(bucketCount, peaks);
       scheduleRenderOverviewWaveform();
     },
-    [scheduleRenderOverviewWaveform],
+    [primeWaveformRaster, scheduleRenderOverviewWaveform],
   );
 
   const computeOverviewPeaks = useCallback(
