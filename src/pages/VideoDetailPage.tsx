@@ -2,17 +2,64 @@ import { useMutation, useQuery } from '@tanstack/react-query';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Link, useParams } from 'react-router-dom';
 
-import { dataSource } from '@/datasource';
-import { dataSourceKind } from '@/datasource';
-import type { Caption, Video } from '@/datasource/types';
+import { dataSource, dataSourceKind } from '@/datasource';
 import { getActiveCaptionAtMs } from '@/lib/captionActive';
 import { captionsToSrt, downloadTextFile, parseCaptionsFromJson, serializeCaptionsToJson } from '@/lib/captionIO';
 import { queryClient } from '@/lib/queryClient';
 import { normalizeTrimRange } from '@/lib/trimRange';
 import type { BurnInWorkerResponse } from '@/workers/burnInWorker';
 import type { TrimWorkerResponse } from '@/workers/trimWorker';
-import type { WaveformWorkerRequest, WaveformWorkerResponse } from '@/workers/waveformWorker';
+import type { WaveformWorkerResponse } from '@/workers/waveformWorker';
 
+import {
+  CAPTION_GAP_MS_STORAGE_KEY,
+  DEFAULT_HOTKEYS,
+  HOTKEY_STORAGE_KEY,
+  TRIM_LOOP_EPSILON_MS,
+  WAVEFORM_FOLLOW_RESUME_MS,
+  WAVEFORM_MAX_BUCKET_COUNT,
+  WAVEFORM_MAX_LOD_SCALE,
+  WAVEFORM_MIN_BUCKET_COUNT,
+  WAVEFORM_PEAK_CACHE_LIMIT,
+  WAVEFORM_PLAYHEAD_RATIO,
+  WAVEFORM_RASTER_CACHE_LIMIT,
+  WAVEFORM_RASTER_MAX_WIDTH,
+  WAVEFORM_RASTER_MEMORY_BUDGET_BYTES,
+  WAVEFORM_RASTER_MIN_WIDTH,
+  WAVEFORM_VIEWPORT_MIN_DURATION_MS,
+} from './videoDetail/constants';
+import {
+  autoAlignCaptions,
+  createCaptionId,
+  formatDate,
+  formatKeyLabel,
+  formatMeta,
+  formatMsWithSeconds,
+  formatNowForFileName,
+  formatSeconds,
+  getCaptionErrors,
+  getLastValidEndMs,
+  isInvalidHotkeyKey,
+  normalizeEventKey,
+  parseCaptionGapMs,
+  sanitizeForFileName,
+  sanitizeHotkeyConfig,
+  snapToStep,
+  sortCaptions,
+} from './videoDetail/utils';
+
+import './VideoDetailPage.css';
+
+import type {
+  Caption,
+  HotkeyConfig,
+  TrimRange,
+  Video,
+  Viewport,
+  WaveformRasterCacheEntry,
+  WaveformWorkerPayload,
+  WebglResources,
+} from './videoDetail/types';
 import type {
   ChangeEvent,
   FocusEvent as ReactFocusEvent,
@@ -20,225 +67,7 @@ import type {
   SyntheticEvent,
 } from 'react';
 
-import './VideoDetailPage.css';
-
-function formatDate(ms: number) {
-  return new Date(ms).toLocaleString();
-}
-
-function formatMeta(video: Video) {
-  const duration =
-    typeof video.durationMs === 'number'
-      ? `${Math.round(video.durationMs / 1000)}s`
-      : null;
-  const resolution =
-    typeof video.width === 'number' && typeof video.height === 'number'
-      ? `${video.width}x${video.height}`
-      : null;
-
-  return [duration, resolution].filter(Boolean).join(' · ');
-}
-
-type CaptionErrors = {
-  startMs?: string;
-  endMs?: string;
-  text?: string;
-};
-
-function sortCaptions(captions: Caption[]) {
-  return [...captions].sort((a, b) => {
-    const aStart = Number.isFinite(a.startMs) ? a.startMs : Number.POSITIVE_INFINITY;
-    const bStart = Number.isFinite(b.startMs) ? b.startMs : Number.POSITIVE_INFINITY;
-    return aStart - bStart;
-  });
-}
-
-function getLastValidEndMs(captions: Caption[]) {
-  for (let i = captions.length - 1; i >= 0; i -= 1) {
-    const endMs = captions[i]?.endMs;
-    if (Number.isFinite(endMs)) return endMs as number;
-  }
-  return 0;
-}
-
-function createCaptionId() {
-  return typeof crypto.randomUUID === 'function'
-    ? crypto.randomUUID()
-    : `caption_${Date.now()}_${Math.random().toString(16).slice(2)}`;
-}
-
-function snapToStep(ms: number, stepMs: number) {
-  if (!Number.isFinite(ms) || stepMs <= 0) return ms;
-  return Math.round(ms / stepMs) * stepMs;
-}
-
-function formatSeconds(valueMs: number) {
-  if (!Number.isFinite(valueMs)) return '';
-  return (Math.max(0, valueMs) / 1000).toFixed(2);
-}
-
-const TRIM_LOOP_EPSILON_MS = 60;
-
-function formatMsWithSeconds(valueMs: number) {
-  if (!Number.isFinite(valueMs)) return '--';
-  const clamped = Math.max(0, Math.round(valueMs));
-  const seconds = (clamped / 1000).toFixed(2);
-  return `${clamped}ms (${seconds}s)`;
-}
-
-type HotkeyConfig = {
-  togglePlay: string;
-  setStart: string;
-  setEnd: string;
-  confirm: string;
-};
-
-const DEFAULT_HOTKEYS: HotkeyConfig = {
-  togglePlay: ' ',
-  setStart: '[',
-  setEnd: ']',
-  confirm: 'Enter',
-};
-
-const HOTKEY_STORAGE_KEY = 'caption_hotkeys';
-const WAVEFORM_VIEWPORT_MIN_DURATION_MS = 500;
-const WAVEFORM_MIN_BUCKET_COUNT = 64;
-const WAVEFORM_MAX_LOD_SCALE = 16;
-const WAVEFORM_PEAK_CACHE_LIMIT = 6;
-const WAVEFORM_MAX_BUCKET_COUNT = 131072;
-const WAVEFORM_RASTER_CACHE_LIMIT = 4;
-const WAVEFORM_RASTER_MAX_WIDTH = 8192;
-const WAVEFORM_RASTER_MEMORY_BUDGET_BYTES = 48 * 1024 * 1024;
-const WAVEFORM_RASTER_MIN_WIDTH = WAVEFORM_MIN_BUCKET_COUNT;
-const WAVEFORM_PLAYHEAD_RATIO = 0.5;
-const WAVEFORM_FOLLOW_RESUME_MS = 1800;
-
 const WINDOW_KEYDOWN_CAPTURE_OPTS = { capture: true } as const;
-
-const CAPTION_GAP_MS_STORAGE_KEY = 'caption_gap_ms';
-
-const INVALID_HOTKEY_KEYS = new Set([
-  'Shift',
-  'Control',
-  'Alt',
-  'Meta',
-  'CapsLock',
-]);
-
-function normalizeEventKey(key: string) {
-  // 일부 구형/특정 환경 대응
-  if (key === 'Spacebar') return ' ';
-  return key;
-}
-
-function isInvalidHotkeyKey(key: string) {
-  return INVALID_HOTKEY_KEYS.has(key);
-}
-
-function sanitizeHotkeyConfig(value: unknown): HotkeyConfig {
-  if (!value || typeof value !== 'object') return { ...DEFAULT_HOTKEYS };
-
-  const parsed = value as Record<keyof HotkeyConfig, unknown>;
-  const next: HotkeyConfig = { ...DEFAULT_HOTKEYS };
-
-  for (const key of Object.keys(DEFAULT_HOTKEYS) as (keyof HotkeyConfig)[]) {
-    const candidate = parsed[key];
-    if (typeof candidate === 'string' && candidate.length > 0) {
-      next[key] = candidate;
-    }
-  }
-
-  return next;
-}
-
-function formatKeyLabel(key: string) {
-  if (key === ' ') return 'Space';
-  if (key === 'Enter') return 'Enter';
-  if (key === 'ArrowLeft') return 'ArrowLeft';
-  if (key === 'ArrowRight') return 'ArrowRight';
-  return key.length === 1 ? key.toUpperCase() : key;
-}
-
-function parseCaptionGapMs(raw: unknown) {
-  const parsed = typeof raw === 'string' ? Number(raw) : Number.NaN;
-  if (!Number.isFinite(parsed)) return 1;
-  return Math.max(0, Math.round(parsed));
-}
-
-function sanitizeForFileName(text: string, fallback: string) {
-  const safe = text.replace(/[^a-zA-Z0-9-_]+/g, '_').replace(/_+/g, '_').replace(/^_+|_+$/g, '');
-  return safe || fallback;
-}
-
-function formatNowForFileName(now = new Date()) {
-  const yyyy = now.getFullYear().toString();
-  const MM = (now.getMonth() + 1).toString().padStart(2, '0');
-  const dd = now.getDate().toString().padStart(2, '0');
-  const hh = now.getHours().toString().padStart(2, '0');
-  const mm = now.getMinutes().toString().padStart(2, '0');
-  const ss = now.getSeconds().toString().padStart(2, '0');
-  return `${yyyy}${MM}${dd}_${hh}${mm}${ss}`;
-}
-
-type WebglResources = {
-  gl: WebGLRenderingContext;
-  program: WebGLProgram;
-  positionBuffer: WebGLBuffer;
-  texCoordBuffer: WebGLBuffer;
-  texture: WebGLTexture;
-  attributes: {
-    position: number;
-    texCoord: number;
-  };
-  uniforms: {
-    texture: WebGLUniformLocation | null;
-    scale: WebGLUniformLocation | null;
-    grayscale: WebGLUniformLocation | null;
-  };
-};
-
-function getCaptionErrors(caption: Caption): CaptionErrors {
-  const errors: CaptionErrors = {};
-  const hasStart = Number.isFinite(caption.startMs);
-  const hasEnd = Number.isFinite(caption.endMs);
-
-  if (!hasStart) errors.startMs = '시작 시간을 입력하세요.';
-  if (!hasEnd) errors.endMs = '종료 시간을 입력하세요.';
-
-  if (hasStart && hasEnd && caption.startMs >= caption.endMs) {
-    errors.endMs = '종료 시간은 시작 시간보다 커야 해요.';
-  }
-
-  if (!caption.text.trim()) {
-    errors.text = '자막 내용을 입력하세요.';
-  }
-
-  return errors;
-}
-
-function autoAlignCaptions(captions: Caption[], gapMs: number) {
-  const sorted = sortCaptions(captions);
-  let prevEnd: number | null = null;
-
-  return sorted.map((caption) => {
-    let startMs = caption.startMs;
-    let endMs = caption.endMs;
-
-    if (!Number.isFinite(startMs)) {
-      startMs = Number.isFinite(prevEnd) ? (prevEnd as number) + gapMs : 0;
-    } else if (Number.isFinite(prevEnd) && startMs < (prevEnd as number) + gapMs) {
-      startMs = (prevEnd as number) + gapMs;
-    }
-
-    if (!Number.isFinite(endMs) || (Number.isFinite(startMs) && endMs <= startMs)) {
-      endMs = (Number.isFinite(startMs) ? (startMs as number) : 0) + 1000;
-    }
-
-    prevEnd = Number.isFinite(endMs) ? endMs : prevEnd;
-
-    return { ...caption, startMs, endMs };
-  });
-}
 
 export default function VideoDetailPage() {
   const { id } = useParams<{ id: string }>();
@@ -250,8 +79,8 @@ export default function VideoDetailPage() {
   const [lastSavedAt, setLastSavedAt] = useState<number | null>(null);
   const [importError, setImportError] = useState<string | null>(null);
   const [durationMs, setDurationMs] = useState<number | null>(null);
-  const [trimRange, setTrimRange] = useState<{ startMs: number; endMs: number } | null>(null);
-  const [waveformViewport, setWaveformViewport] = useState<{ startMs: number; endMs: number } | null>(null);
+  const [trimRange, setTrimRange] = useState<TrimRange | null>(null);
+  const [waveformViewport, setWaveformViewport] = useState<Viewport | null>(null);
   const [shouldLoopTrim, setShouldLoopTrim] = useState(false);
   const [applyTrimOnExport, setApplyTrimOnExport] = useState(false);
   const [hotkeyConfig, setHotkeyConfig] = useState<HotkeyConfig>(() => {
@@ -282,7 +111,7 @@ export default function VideoDetailPage() {
   });
   const trimInputFocusRef = useRef<'start' | 'end' | null>(null);
   const timelineRef = useRef<HTMLDivElement | null>(null);
-  const trimRangeRef = useRef<{ startMs: number; endMs: number } | null>(null);
+  const trimRangeRef = useRef<TrimRange | null>(null);
   const [dragTarget, setDragTarget] = useState<'start' | 'end' | 'new' | null>(null);
 
   const {
@@ -323,19 +152,13 @@ export default function VideoDetailPage() {
   const waveformSamplesReadyRef = useRef(false);
   const waveformOverviewPeaksRef = useRef<Int16Array | null>(null);
   const waveformPeaksCacheRef = useRef<Map<number, Int16Array>>(new Map());
-  type WaveformRasterCacheEntry = {
-    canvas: OffscreenCanvas | HTMLCanvasElement;
-    bytes: number;
-    rasterWidth: number;
-  };
-
   const waveformRasterCacheRef = useRef<Map<string, WaveformRasterCacheEntry>>(new Map());
   const waveformRasterBytesRef = useRef(0);
   const waveformRasterKeyRef = useRef<string | null>(null);
   const waveformRasterHeightRef = useRef<number>(0);
   const waveformOverviewRenderRafIdRef = useRef<number | null>(null);
   const waveformBucketCountRef = useRef<number | null>(null);
-  const waveformViewportRef = useRef<{ startMs: number; endMs: number } | null>(null);
+  const waveformViewportRef = useRef<Viewport | null>(null);
   const waveformViewportCommitTimerRef = useRef<number | null>(null);
   const renderOverviewWaveformRef = useRef<(() => void) | null>(null);
   const waveformWheelRafIdRef = useRef<number | null>(null);
@@ -1595,7 +1418,7 @@ export default function VideoDetailPage() {
     waveformViewportRef.current = waveformViewport;
   }, [waveformViewport]);
 
-  const commitWaveformViewportState = useCallback((next: { startMs: number; endMs: number }) => {
+  const commitWaveformViewportState = useCallback((next: Viewport) => {
     if (waveformViewportCommitTimerRef.current !== null) {
       window.clearTimeout(waveformViewportCommitTimerRef.current);
     }
@@ -1606,7 +1429,7 @@ export default function VideoDetailPage() {
   }, []);
 
   const setWaveformViewportFast = useCallback(
-    (next: { startMs: number; endMs: number }) => {
+    (next: Viewport) => {
       waveformViewportRef.current = next;                 // ref를 진짜 source로 사용
       renderOverviewWaveformRef.current?.();              // rAF로 캔버스 redraw
       commitWaveformViewportState(next);                  // state는 디바운스 커밋
@@ -1624,7 +1447,7 @@ export default function VideoDetailPage() {
   }, []);
 
   const clampWaveformViewport = useCallback(
-    (startMs: number, durationMs: number): { startMs: number; endMs: number } | null => {
+    (startMs: number, durationMs: number): Viewport | null => {
       if (typeof effectiveDurationMs !== 'number' || effectiveDurationMs <= 0) return null;
 
       const minDuration = Math.min(WAVEFORM_VIEWPORT_MIN_DURATION_MS, effectiveDurationMs);
@@ -1873,10 +1696,6 @@ export default function VideoDetailPage() {
     };
   }, [trimResultUrl]);
 
-  type WaveformWorkerPayload =
-    | Omit<Extract<WaveformWorkerRequest, { type: 'load-samples' }>, 'requestId'>
-    | Omit<Extract<WaveformWorkerRequest, { type: 'compute-peaks' }>, 'requestId'>;
-
   const postWaveformWorkerMessage = useCallback(
     (message: WaveformWorkerPayload, transfer: Transferable[] = []) => {
       const worker = waveformWorkerRef.current;
@@ -1895,7 +1714,8 @@ export default function VideoDetailPage() {
           resolve(response);
         });
 
-        worker.postMessage({ ...(message as WaveformWorkerRequest), requestId }, transfer);
+        const payload = { ...message, requestId } satisfies WaveformWorkerPayload & { requestId: number };
+        worker.postMessage(payload, transfer);
       });
     },
     [],
@@ -3052,7 +2872,7 @@ export default function VideoDetailPage() {
   );
 
   const updateTrimRange = useCallback(
-    (next: { startMs: number; endMs: number }) => {
+    (next: TrimRange) => {
       setTrimRange((prev) => {
         const snappedStart = snapToStep(next.startMs, snapStepMs);
         const snappedEnd = snapToStep(next.endMs, snapStepMs);
