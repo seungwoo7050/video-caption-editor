@@ -20,6 +20,10 @@ export type Caption = {
 export type CreateVideoInput = {
   title: string
   id?: VideoId
+  createdAt?: number
+  durationMs?: number
+  width?: number
+  height?: number
 }
 
 export type VideoMetadataPatch = Partial<Pick<Video, 'durationMs' | 'width' | 'height'>>;

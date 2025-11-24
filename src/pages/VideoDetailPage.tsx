@@ -413,7 +413,7 @@ export default function VideoDetailPage() {
     enabled: Boolean(videoId),
     queryFn: async () => {
       const blob = await dataSource.getVideoBlob(videoId);
-      if (!blob) throw new Error('영상 파일을 불러올 수 없어요.');
+      if (!blob) throw new Error('원본 파일을 찾을 수 없어요. (로컬 저장소)');
       return blob;
     },
   });
@@ -4096,7 +4096,12 @@ export default function VideoDetailPage() {
                   color: '#b00020',
                 }}
               >
-                영상 파일을 불러오지 못했어요.
+                <div style={{ fontWeight: 700, marginBottom: 6 }}>영상 파일을 불러오지 못했어요.</div>
+                <div style={{ fontSize: 13 }}>
+                  {videoBlobError instanceof Error
+                    ? videoBlobError.message
+                    : '알 수 없는 오류가 발생했어요.'}
+                </div>
               </div>
             ) : videoUrl ? (
               <>

@@ -2,8 +2,9 @@ import { useEffect, useMemo, useState } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
 
 
-import { dataSource } from '@/datasource';
+import { dataSource, dataSourceKind } from '@/datasource';
 import type { Video } from '@/datasource/types';
+import { saveVideoAssetsAtomically } from '@/lib/localAssetStore';
 import { queryClient } from '@/lib/queryClient';
 import { captureThumbnailFromFile } from '@/lib/thumbnailGenerator';
 
@@ -141,11 +142,25 @@ export default function UploadPage() {
     try {
       const videoId = generateVideoId();
       const trimmedTitle = title.trim();
+      const createdAt = Date.now();
 
-      await dataSource.putVideoBlob(videoId, videoFile);
-      await dataSource.putThumbBlob(videoId, thumbnailBlob);
+      if (dataSourceKind === 'mock') {
+        await saveVideoAssetsAtomically({
+          record: {
+            id: videoId,
+            title: trimmedTitle,
+            createdAt,
+            videoBlobKey: videoId,
+          },
+          videoBlob: videoFile,
+          thumbnailBlob: thumbnailBlob ?? undefined,
+        });
+      } else {
+        await dataSource.putVideoBlob(videoId, videoFile);
+        await dataSource.putThumbBlob(videoId, thumbnailBlob);
+      }
 
-      const video = await dataSource.createVideo({ id: videoId, title: trimmedTitle });
+      const video = await dataSource.createVideo({ id: videoId, title: trimmedTitle, createdAt });
 
       queryClient.setQueryData(['videos'], (prev: Video[] | undefined) =>
         prev ? [video, ...prev] : [video],
