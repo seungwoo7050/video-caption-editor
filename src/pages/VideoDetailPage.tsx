@@ -107,6 +107,9 @@ const WAVEFORM_MAX_LOD_SCALE = 16;
 const WAVEFORM_PEAK_CACHE_LIMIT = 6;
 const WAVEFORM_MAX_BUCKET_COUNT = 131072;
 const WAVEFORM_RASTER_CACHE_LIMIT = 4;
+const WAVEFORM_RASTER_MAX_WIDTH = 8192;
+const WAVEFORM_RASTER_MEMORY_BUDGET_BYTES = 48 * 1024 * 1024;
+const WAVEFORM_RASTER_MIN_WIDTH = WAVEFORM_MIN_BUCKET_COUNT;
 const WAVEFORM_PLAYHEAD_RATIO = 0.5;
 const WAVEFORM_FOLLOW_RESUME_MS = 1800;
 
@@ -320,7 +323,14 @@ export default function VideoDetailPage() {
   const waveformSamplesReadyRef = useRef(false);
   const waveformOverviewPeaksRef = useRef<Int16Array | null>(null);
   const waveformPeaksCacheRef = useRef<Map<number, Int16Array>>(new Map());
-  const waveformRasterCacheRef = useRef<Map<string, OffscreenCanvas | HTMLCanvasElement>>(new Map());
+  type WaveformRasterCacheEntry = {
+    canvas: OffscreenCanvas | HTMLCanvasElement;
+    bytes: number;
+    rasterWidth: number;
+  };
+
+  const waveformRasterCacheRef = useRef<Map<string, WaveformRasterCacheEntry>>(new Map());
+  const waveformRasterBytesRef = useRef(0);
   const waveformRasterKeyRef = useRef<string | null>(null);
   const waveformRasterHeightRef = useRef<number>(0);
   const waveformOverviewRenderRafIdRef = useRef<number | null>(null);
@@ -1893,6 +1903,7 @@ export default function VideoDetailPage() {
 
   const clearWaveformRasterCache = useCallback(() => {
     waveformRasterCacheRef.current.clear();
+    waveformRasterBytesRef.current = 0;
     waveformRasterKeyRef.current = null;
     waveformRasterHeightRef.current = 0;
   }, []);
@@ -1930,37 +1941,128 @@ export default function VideoDetailPage() {
     return Math.min(WAVEFORM_MAX_BUCKET_COUNT, bucketCount);
   }, [effectiveDurationMs, waveformViewport?.endMs, waveformViewport?.startMs]);
 
-  const touchWaveformRasterCache = useCallback((key: string, canvas: OffscreenCanvas | HTMLCanvasElement) => {
-    const cache = waveformRasterCacheRef.current;
-    cache.delete(key);
-    cache.set(key, canvas);
-    if (cache.size > WAVEFORM_RASTER_CACHE_LIMIT) {
-      const oldest = cache.keys().next();
-      if (!oldest.done) cache.delete(oldest.value);
-    }
-  }, []);
+  const getWaveformRasterWidth = useCallback(
+    (bucketCount: number) =>
+      Math.max(WAVEFORM_RASTER_MIN_WIDTH, Math.min(bucketCount, WAVEFORM_RASTER_MAX_WIDTH)),
+    [],
+  );
+
+  const formatRasterBytes = useCallback((bytes: number) => `${(bytes / (1024 * 1024)).toFixed(1)}MB`, []);
+
+  const touchWaveformRasterCache = useCallback(
+    (key: string, canvas: OffscreenCanvas | HTMLCanvasElement) => {
+      const cache = waveformRasterCacheRef.current;
+      let totalBytes = waveformRasterBytesRef.current;
+
+      const existing = cache.get(key);
+      if (existing) {
+        totalBytes -= existing.bytes;
+      }
+
+      const rasterWidth = Math.max(1, canvas.width || 0);
+      const bytes = Math.max(0, rasterWidth * Math.max(1, canvas.height || 0) * 4);
+      cache.delete(key);
+      cache.set(key, { canvas, bytes, rasterWidth });
+      totalBytes += bytes;
+
+      const evictOldest = () => {
+        const oldest = cache.keys().next();
+        if (oldest.done) return false;
+        const oldestKey = oldest.value;
+        const oldestEntry = cache.get(oldestKey);
+        cache.delete(oldestKey);
+        if (oldestEntry) {
+          totalBytes -= oldestEntry.bytes;
+          if (import.meta.env.DEV) {
+            console.debug(
+              `[waveform] raster evicted (key=${oldestKey}, width=${oldestEntry.rasterWidth}, total=${formatRasterBytes(totalBytes)})`,
+            );
+          }
+        }
+        return true;
+      };
+
+      while (cache.size > WAVEFORM_RASTER_CACHE_LIMIT) {
+        if (!evictOldest()) break;
+      }
+
+      while (totalBytes > WAVEFORM_RASTER_MEMORY_BUDGET_BYTES && cache.size > 0) {
+        if (!evictOldest()) break;
+      }
+
+      waveformRasterBytesRef.current = totalBytes;
+      return totalBytes;
+    },
+    [formatRasterBytes],
+  );
 
   const getWaveformRasterKey = useCallback(
-    (bucketCount: number, height: number, dpr: number) => `${bucketCount}|${height}|${Math.round(dpr * 100)}`,
+    (bucketCount: number, rasterWidth: number, height: number, dpr: number) =>
+      `${bucketCount}|${rasterWidth}|${height}|${Math.round(dpr * 100)}`,
     [],
   );
 
   const createWaveformRasterCanvas = useCallback((width: number, height: number) => {
-    if (typeof OffscreenCanvas !== 'undefined') {
-      return new OffscreenCanvas(width, height);
+    try {
+      if (typeof OffscreenCanvas !== 'undefined') {
+        return new OffscreenCanvas(width, height);
+      }
+      const canvas = document.createElement('canvas');
+      canvas.width = width;
+      canvas.height = height;
+      return canvas;
+    } catch (error) {
+      if (import.meta.env.DEV) {
+        console.warn(`[waveform] raster canvas creation failed (width=${width}, height=${height})`, error);
+      }
+      return null;
     }
-    const canvas = document.createElement('canvas');
-    canvas.width = width;
-    canvas.height = height;
-    return canvas;
+  }, []);
+
+  const downsampleWaveformPeaks = useCallback((peaks: Int16Array, sourceBucketCount: number, targetBucketCount: number) => {
+    const safeTarget = Math.max(1, targetBucketCount);
+    const safeSource = Math.max(1, sourceBucketCount);
+    const result = new Int16Array(safeTarget * 2);
+    const ratio = safeSource / safeTarget;
+
+    for (let bucket = 0; bucket < safeTarget; bucket += 1) {
+      const start = Math.floor(bucket * ratio);
+      const end = Math.max(start + 1, Math.floor((bucket + 1) * ratio));
+      let min = 32767;
+      let max = -32768;
+      for (let source = start; source < end && source < safeSource; source += 1) {
+        const sourceMin = peaks[source * 2] ?? 0;
+        const sourceMax = peaks[source * 2 + 1] ?? 0;
+        if (sourceMin < min) min = sourceMin;
+        if (sourceMax > max) max = sourceMax;
+      }
+      result[bucket * 2] = min === 32767 ? 0 : min;
+      result[bucket * 2 + 1] = max === -32768 ? 0 : max;
+    }
+
+    return result;
   }, []);
 
   const rasterizeWaveform = useCallback(
-    (bucketCount: number, peaks: Int16Array, height: number) => {
-      const width = Math.max(1, bucketCount);
+    (bucketCount: number, peaks: Int16Array, height: number, rasterWidth?: number, allowFallback = true): OffscreenCanvas | HTMLCanvasElement | null => {
+      const width = Math.max(1, Math.min(rasterWidth ?? bucketCount, WAVEFORM_RASTER_MAX_WIDTH));
+      const effectivePeaks = bucketCount > width ? downsampleWaveformPeaks(peaks, bucketCount, width) : peaks;
       const rasterCanvas = createWaveformRasterCanvas(width, height);
+      if (!rasterCanvas) {
+        clearWaveformRasterCache();
+        if (allowFallback && width > WAVEFORM_RASTER_MIN_WIDTH) {
+          return rasterizeWaveform(bucketCount, peaks, height, WAVEFORM_RASTER_MIN_WIDTH, false);
+        }
+        return null;
+      }
       const context = rasterCanvas.getContext('2d');
-      if (!context) return null;
+      if (!context) {
+        clearWaveformRasterCache();
+        if (allowFallback && width > WAVEFORM_RASTER_MIN_WIDTH) {
+          return rasterizeWaveform(bucketCount, peaks, height, WAVEFORM_RASTER_MIN_WIDTH, false);
+        }
+        return null;
+      }
 
       context.clearRect(0, 0, width, height);
       context.lineWidth = 1;
@@ -1968,9 +2070,9 @@ export default function VideoDetailPage() {
 
       const halfHeight = height / 2;
       context.beginPath();
-      for (let bucket = 0; bucket < bucketCount; bucket += 1) {
-        const min = (peaks[bucket * 2] ?? 0) / 32768;
-        const max = (peaks[bucket * 2 + 1] ?? 0) / 32767;
+      for (let bucket = 0; bucket < width; bucket += 1) {
+        const min = (effectivePeaks[bucket * 2] ?? 0) / 32768;
+        const max = (effectivePeaks[bucket * 2 + 1] ?? 0) / 32767;
         const x = bucket + 0.5;
         const yMin = halfHeight + min * halfHeight;
         const yMax = halfHeight + max * halfHeight;
@@ -1981,7 +2083,11 @@ export default function VideoDetailPage() {
 
       return rasterCanvas;
     },
-    [createWaveformRasterCanvas],
+    [
+      clearWaveformRasterCache,
+      createWaveformRasterCanvas,
+      downsampleWaveformPeaks,
+    ],
   );
 
   const primeWaveformRaster = useCallback(
@@ -1993,27 +2099,35 @@ export default function VideoDetailPage() {
         : waveformRasterHeightRef.current;
       if (!targetHeight) return;
 
-      const key = getWaveformRasterKey(bucketCount, targetHeight, dpr);
+      const rasterWidth = getWaveformRasterWidth(bucketCount);
+      const key = getWaveformRasterKey(bucketCount, rasterWidth, targetHeight, dpr);
       const cache = waveformRasterCacheRef.current;
       const cached = cache.get(key);
       if (cached) {
-        touchWaveformRasterCache(key, cached);
+        const totalBytes = touchWaveformRasterCache(key, cached.canvas);
         waveformRasterKeyRef.current = key;
         if (import.meta.env.DEV) {
-          console.debug(`[waveform] raster cache hit (key=${key}, entries=${cache.size})`);
+          console.debug(
+            `[waveform] raster cache hit (key=${key}, width=${cached.rasterWidth}, total=${formatRasterBytes(totalBytes)})`,
+          );
         }
         return;
-      }if (cache.has(key)) return;
+      }
+      if (cache.has(key)) return;
 
-      const raster = rasterizeWaveform(bucketCount, peaks, targetHeight);
+      const raster = rasterizeWaveform(bucketCount, peaks, targetHeight, rasterWidth);
       if (!raster) return;
-      touchWaveformRasterCache(key, raster);
-      waveformRasterKeyRef.current = key;
+      const finalWidth = Math.max(1, raster.width || rasterWidth);
+      const finalKey = getWaveformRasterKey(bucketCount, finalWidth, targetHeight, dpr);
+      const totalBytes = touchWaveformRasterCache(finalKey, raster);
+      waveformRasterKeyRef.current = finalKey;
       if (import.meta.env.DEV) {
-        console.debug(`[waveform] raster cached (key=${key}, entries=${cache.size})`);
+        console.debug(
+          `[waveform] raster cached (key=${finalKey}, width=${finalWidth}, total=${formatRasterBytes(totalBytes)})`,
+        );
       }
     },
-    [getWaveformRasterKey, rasterizeWaveform, touchWaveformRasterCache],
+    [formatRasterBytes, getWaveformRasterKey, getWaveformRasterWidth, rasterizeWaveform, touchWaveformRasterCache],
   );
 
   const xToMs = useCallback(
@@ -2354,30 +2468,45 @@ export default function VideoDetailPage() {
     if (!(viewportDurationMs > 0)) return;
 
     const cache = waveformRasterCacheRef.current;
-    const targetKey = bucketCount && bucketCount > 0 ? getWaveformRasterKey(bucketCount, height, dpr) : null;
+    const targetRasterWidth = bucketCount && bucketCount > 0 ? getWaveformRasterWidth(bucketCount) : null;
+    const targetKey = bucketCount && bucketCount > 0 && targetRasterWidth
+      ? getWaveformRasterKey(bucketCount, targetRasterWidth, height, dpr)
+      : null;
 
     let rasterCanvas: OffscreenCanvas | HTMLCanvasElement | null = null;
 
     if (targetKey) {
       const cached = cache.get(targetKey) ?? null;
       if (cached) {
-        touchWaveformRasterCache(targetKey, cached);
+        const totalBytes = touchWaveformRasterCache(targetKey, cached.canvas);
         waveformRasterKeyRef.current = targetKey;
-        rasterCanvas = cached;
+        rasterCanvas = cached.canvas;
+        if (import.meta.env.DEV) {
+          console.debug(
+            `[waveform] raster cache hit (key=${targetKey}, width=${cached.rasterWidth}, total=${formatRasterBytes(totalBytes)})`,
+          );
+        }
       }
     }
 
-    if (!rasterCanvas && peaks && bucketCount && targetKey) {
-      const generated = rasterizeWaveform(bucketCount, peaks, height);
+    if (!rasterCanvas && peaks && bucketCount && targetRasterWidth && targetKey) {
+      const generated = rasterizeWaveform(bucketCount, peaks, height, targetRasterWidth);
       if (generated) {
-        touchWaveformRasterCache(targetKey, generated);
-        waveformRasterKeyRef.current = targetKey;
+        const finalWidth = Math.max(1, generated.width || targetRasterWidth);
+        const finalKey = getWaveformRasterKey(bucketCount, finalWidth, height, dpr);
+        const totalBytes = touchWaveformRasterCache(finalKey, generated);
+        waveformRasterKeyRef.current = finalKey;
         rasterCanvas = generated;
+        if (import.meta.env.DEV) {
+          console.debug(
+            `[waveform] raster cached (key=${finalKey}, width=${finalWidth}, total=${formatRasterBytes(totalBytes)})`,
+          );
+        }
       }
     }
 
     if (!rasterCanvas && waveformRasterKeyRef.current) {
-      rasterCanvas = cache.get(waveformRasterKeyRef.current) ?? null;
+      rasterCanvas = cache.get(waveformRasterKeyRef.current)?.canvas ?? null;
     }
 
     context.clearRect(0, 0, width, height);
@@ -2419,6 +2548,8 @@ export default function VideoDetailPage() {
     }
   }, [
     effectiveDurationMs,
+    formatRasterBytes,
+    getWaveformRasterWidth,
     getWaveformRasterKey,
     msToX,
     rasterizeWaveform,
