@@ -3,14 +3,20 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Link, useParams } from 'react-router-dom';
 
 import { dataSource, dataSourceKind } from '@/datasource';
-import { getActiveCaptionAtMs } from '@/lib/captionActive';
-import { captionsToSrt, downloadTextFile, parseCaptionsFromJson, serializeCaptionsToJson } from '@/lib/captionIO';
+import { downloadTextFile } from '@/lib/captionIO';
 import { queryClient } from '@/lib/queryClient';
 import { normalizeTrimRange } from '@/lib/trimRange';
 import type { BurnInWorkerResponse } from '@/workers/burnInWorker';
 import type { TrimWorkerResponse } from '@/workers/trimWorker';
 import type { WaveformWorkerResponse } from '@/workers/waveformWorker';
 
+import {
+  createCaptionExportJson,
+  createCaptionExportSrt,
+  parseCaptionJsonForPage,
+} from './videoDetail/captions/captionIO';
+import { getActiveCaption } from './videoDetail/captions/captionSelectors';
+import { getCaptionErrors } from './videoDetail/captions/captionValidation';
 import {
   CAPTION_GAP_MS_STORAGE_KEY,
   DEFAULT_HOTKEYS,
@@ -37,7 +43,6 @@ import {
   formatMsWithSeconds,
   formatNowForFileName,
   formatSeconds,
-  getCaptionErrors,
   getLastValidEndMs,
   isInvalidHotkeyKey,
   normalizeEventKey,
@@ -257,7 +262,7 @@ export default function VideoDetailPage() {
   }, [videoBlob]);
 
   const activeCaption = useMemo(() => {
-    return getActiveCaptionAtMs(captionDrafts, currentTimeMs ?? Number.NaN);
+    return getActiveCaption(captionDrafts, currentTimeMs);
   }, [captionDrafts, currentTimeMs]);
 
   const activeCaptionId = activeCaption?.id ?? null;
@@ -926,42 +931,15 @@ export default function VideoDetailPage() {
     return new URL('/fonts/NotoSansKR-Regular.ttf', window.location.origin).toString();
   }, []);
 
-  const getCaptionsForExport = useCallback(() => {
-    if (!applyTrimOnExport || !trimRange) return captionDrafts;
-
-    const { startMs, endMs } = trimRange;
-    if (!Number.isFinite(startMs) || !Number.isFinite(endMs)) return captionDrafts;
-
-    const trimStart = Math.max(0, Math.min(startMs, endMs));
-    const trimEnd = Math.max(trimStart, Math.max(startMs, endMs));
-    if (trimEnd <= trimStart) return [];
-
-    const trimmed = captionDrafts
-      .filter((caption) => Number.isFinite(caption.startMs) && Number.isFinite(caption.endMs))
-      .filter((caption) => caption.endMs > trimStart && caption.startMs < trimEnd)
-      .map((caption) => {
-        const clippedStart = Math.max(caption.startMs, trimStart);
-        const clippedEnd = Math.min(caption.endMs, trimEnd);
-        return {
-          ...caption,
-          startMs: clippedStart - trimStart,
-          endMs: clippedEnd - trimStart,
-        };
-      });
-    return sortCaptions(trimmed);
-  }, [applyTrimOnExport, captionDrafts, trimRange]);
-
   const handleExportJson = useCallback(() => {
-    const captionsForExport = getCaptionsForExport();
-    const json = serializeCaptionsToJson(captionsForExport);
+    const json = createCaptionExportJson(captionDrafts, { applyTrimOnExport, trimRange });
     downloadTextFile(`${baseFileName}.json`, json, 'application/json;charset=utf-8');
-  }, [baseFileName, getCaptionsForExport]);
+  }, [applyTrimOnExport, baseFileName, captionDrafts, trimRange]);
 
   const handleExportSrt = useCallback(() => {
-    const captionsForExport = getCaptionsForExport();
-    const srt = captionsToSrt(captionsForExport);
+    const srt = createCaptionExportSrt(captionDrafts, { applyTrimOnExport, trimRange });
     downloadTextFile(`${baseFileName}.srt`, srt, 'application/x-subrip;charset=utf-8');
-  }, [baseFileName, getCaptionsForExport]);
+  }, [applyTrimOnExport, baseFileName, captionDrafts, trimRange]);
 
   const stopBurnInWorker = useCallback(() => {
     const worker = burnInWorkerRef.current;
@@ -1013,7 +991,7 @@ export default function VideoDetailPage() {
       return;
     }
 
-    const srt = captionsToSrt(captionDrafts);
+    const srt = createCaptionExportSrt(captionDrafts, { applyTrimOnExport: false, trimRange: null });
 
     stopBurnInWorker();
     if (burnInResultUrl) {
@@ -1111,8 +1089,8 @@ export default function VideoDetailPage() {
 
       try {
         const text = await file.text();
-        const imported = parseCaptionsFromJson(text, createCaptionId);
-        setCaptionDrafts(autoAlignCaptions(imported, captionGapMs));
+        const imported = parseCaptionJsonForPage(text, createCaptionId, captionGapMs);
+        setCaptionDrafts(imported);
         setImportError(null);
         resetSaveCaptionsError();
       } catch (err) {
