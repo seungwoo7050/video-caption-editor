@@ -6,8 +6,6 @@ import { dataSource, dataSourceKind } from '@/datasource';
 import { downloadTextFile } from '@/lib/captionIO';
 import { queryClient } from '@/lib/queryClient';
 import { normalizeTrimRange } from '@/lib/trimRange';
-import type { BurnInWorkerResponse } from '@/workers/burnInWorker';
-import type { TrimWorkerResponse } from '@/workers/trimWorker';
 import type { WaveformWorkerResponse } from '@/workers/waveformWorker';
 
 import {
@@ -34,6 +32,8 @@ import {
   WAVEFORM_RASTER_MIN_WIDTH,
   WAVEFORM_VIEWPORT_MIN_DURATION_MS,
 } from './videoDetail/constants';
+import { useBurnInExport } from './videoDetail/export/useBurnInExport';
+import { useTrimExport } from './videoDetail/export/useTrimExport';
 import {
   autoAlignCaptions,
   createCaptionId,
@@ -41,7 +41,6 @@ import {
   formatKeyLabel,
   formatMeta,
   formatMsWithSeconds,
-  formatNowForFileName,
   formatSeconds,
   getLastValidEndMs,
   isInvalidHotkeyKey,
@@ -210,20 +209,6 @@ export default function VideoDetailPage() {
   const [shouldUseLiveWaveform, setShouldUseLiveWaveform] = useState(false);
   const videoFrameRequestIdRef = useRef<number | null>(null);
   const animationFrameIdRef = useRef<number | null>(null);
-  const burnInWorkerRef = useRef<Worker | null>(null);
-  const [isBurningIn, setIsBurningIn] = useState(false);
-  const [burnInProgress, setBurnInProgress] = useState<number | null>(null);
-  const [burnInMessage, setBurnInMessage] = useState<string | null>(null);
-  const [burnInError, setBurnInError] = useState<string | null>(null);
-  const [burnInResultUrl, setBurnInResultUrl] = useState<string | null>(null);
-  const [burnInFileName, setBurnInFileName] = useState<string | null>(null);
-  const trimWorkerRef = useRef<Worker | null>(null);
-  const [isTrimming, setIsTrimming] = useState(false);
-  const [trimProgress, setTrimProgress] = useState<number | null>(null);
-  const [trimMessage, setTrimMessage] = useState<string | null>(null);
-  const [trimError, setTrimError] = useState<string | null>(null);
-  const [trimResultUrl, setTrimResultUrl] = useState<string | null>(null);
-  const [trimFileName, setTrimFileName] = useState<string | null>(null);
 
   const {
     data: videoBlob,
@@ -290,16 +275,6 @@ export default function VideoDetailPage() {
       if (thumbnailUrl) URL.revokeObjectURL(thumbnailUrl);
     };
   }, [thumbnailUrl]);
-
-  useEffect(() => {
-    return () => {
-      if (burnInResultUrl) {
-        URL.revokeObjectURL(burnInResultUrl);
-      }
-      const worker = burnInWorkerRef.current;
-      if (worker) worker.terminate();
-    };
-  }, [burnInResultUrl]);
 
   useEffect(() => {
     const worker = new Worker(new URL('../workers/waveformWorker.ts', import.meta.url), {
@@ -636,11 +611,6 @@ export default function VideoDetailPage() {
     return 'video';
   }, [video, videoId]);
 
-  const burnInFontUrl = useMemo(() => {
-    if (typeof window === 'undefined') return '';
-    return new URL('/fonts/NotoSansKR-Regular.ttf', window.location.origin).toString();
-  }, []);
-
   const handleExportJson = useCallback(() => {
     const json = createCaptionExportJson(captionDrafts, { applyTrimOnExport, trimRange });
     downloadTextFile(`${baseFileName}.json`, json, 'application/json;charset=utf-8');
@@ -650,143 +620,6 @@ export default function VideoDetailPage() {
     const srt = createCaptionExportSrt(captionDrafts, { applyTrimOnExport, trimRange });
     downloadTextFile(`${baseFileName}.srt`, srt, 'application/x-subrip;charset=utf-8');
   }, [applyTrimOnExport, baseFileName, captionDrafts, trimRange]);
-
-  const stopBurnInWorker = useCallback(() => {
-    const worker = burnInWorkerRef.current;
-    if (worker) {
-      worker.terminate();
-      burnInWorkerRef.current = null;
-    }
-  }, []);
-
-  const stopTrimWorker = useCallback(() => {
-    const worker = trimWorkerRef.current;
-    if (worker) {
-      worker.terminate();
-      trimWorkerRef.current = null;
-    }
-  }, []);
-
-  const handleCancelBurnIn = useCallback(() => {
-    stopBurnInWorker();
-    setIsBurningIn(false);
-    setBurnInProgress(null);
-    setBurnInMessage('번인 내보내기를 취소했어요.');
-  }, [stopBurnInWorker]);
-
-  const handleBurnInExport = useCallback(async () => {
-    if (!videoBlob) {
-      setBurnInError('영상 파일을 찾지 못했어요. 다시 시도해 주세요.');
-      return;
-    }
-
-    if (!burnInFontUrl) {
-      setBurnInError('폰트 파일 경로를 준비하지 못했어요.');
-      return;
-    }
-
-    const mime = videoBlob.type || '';
-    if (!mime.includes('mp4')) {
-      setBurnInError('mp4 영상만 번인 내보내기를 지원해요.');
-      return;
-    }
-
-    if (videoBlob.size > 50 * 1024 * 1024) {
-      setBurnInError('50MB 이하의 mp4만 번인 내보내기를 지원해요.');
-      return;
-    }
-
-    if (typeof durationMs === 'number' && durationMs > 30_000) {
-      setBurnInError('길이 30초 이하의 영상을 사용해 주세요.');
-      return;
-    }
-
-    const srt = createCaptionExportSrt(captionDrafts, { applyTrimOnExport: false, trimRange: null });
-
-    stopBurnInWorker();
-    if (burnInResultUrl) {
-      URL.revokeObjectURL(burnInResultUrl);
-      setBurnInResultUrl(null);
-    }
-
-    setBurnInError(null);
-    setBurnInProgress(0);
-    setBurnInMessage('ffmpeg.wasm을 로드하는 중이에요…');
-    setIsBurningIn(true);
-
-    const worker = new Worker(new URL('../workers/burnInWorker.ts', import.meta.url), {
-      type: 'module',
-    });
-
-    burnInWorkerRef.current = worker;
-    const requestId = Date.now();
-
-    const fileName = `${safeTitleOrId}_burnin_${formatNowForFileName()}.mp4`;
-    setBurnInFileName(fileName);
-
-    function handleError(errorEvent: ErrorEvent) {
-      console.error('[burn-in-worker] crashed', errorEvent);
-      setBurnInError('번인 작업 중 오류가 발생했어요. 다시 시도해 주세요.');
-      setIsBurningIn(false);
-      worker.removeEventListener('message', handleMessage);
-      worker.removeEventListener('error', handleError);
-      stopBurnInWorker();
-    }
-
-    function handleMessage(event: MessageEvent<BurnInWorkerResponse>) {
-      const data = event.data;
-      if (!data || data.requestId !== requestId) return;
-
-      if (data.type === 'progress') {
-        if (typeof data.progress === 'number') setBurnInProgress(data.progress);
-        if (data.message) setBurnInMessage(data.message);
-        return;
-      }
-
-      if (data.type === 'done') {
-        const blob = new Blob([data.output], { type: 'video/mp4' });
-        const url = URL.createObjectURL(blob);
-        setBurnInResultUrl(url);
-        setBurnInMessage('자막이 포함된 mp4가 준비됐어요.');
-        setIsBurningIn(false);
-        worker.removeEventListener('message', handleMessage);
-        worker.removeEventListener('error', handleError);
-        stopBurnInWorker();
-
-        const link = document.createElement('a');
-        link.href = url;
-        link.download = fileName;
-        link.click();
-        return;
-      }
-
-      if (data.type === 'error') {
-        setBurnInError('번인 내보내기에 실패했어요. 잠시 후 다시 시도해 주세요.');
-        console.error('[burn-in-worker] error', data.message);
-        setIsBurningIn(false);
-        worker.removeEventListener('message', handleMessage);
-        worker.removeEventListener('error', handleError);
-        stopBurnInWorker();
-      }
-    }
-
-    worker.addEventListener('message', handleMessage);
-    worker.addEventListener('error', handleError);
-
-    const videoBuffer = await videoBlob.arrayBuffer();
-    worker.postMessage(
-      { type: 'burn-in', requestId, videoData: videoBuffer, srtText: srt, fontUrl: burnInFontUrl },
-      [videoBuffer],
-    );
-  }, [
-    burnInFontUrl,
-    burnInResultUrl,
-    durationMs,
-    captionDrafts,
-    safeTitleOrId,
-    stopBurnInWorker,
-    videoBlob,
-  ]);
 
   const handleImportJsonClick = useCallback(() => {
     fileInputRef.current?.click();
@@ -1192,162 +1025,34 @@ export default function VideoDetailPage() {
     typeof currentTimeMs === 'number' &&
     Number.isFinite(currentTimeMs);
 
-  const handleTrimExport = useCallback(async () => {
-    if (!applyTrimOnExport) return;
+  const {
+    burnInError,
+    burnInFileName,
+    burnInMessage,
+    burnInProgress,
+    burnInResultUrl,
+    handleBurnInExport,
+    handleCancelBurnIn,
+    isBurningIn,
+  } = useBurnInExport({ captionDrafts, durationMs, safeTitleOrId, videoBlob });
 
-    if (!trimRange) {
-      setTrimError('트림 구간을 먼저 선택해 주세요.');
-      return;
-    }
-
-    if (!videoBlob) {
-      setTrimError('영상 파일을 찾지 못했어요. 다시 시도해 주세요.');
-      return;
-    }
-
-    const mime = videoBlob.type || '';
-    if (!mime.includes('mp4')) {
-      setTrimError('mp4 영상만 구간 내보내기를 지원해요.');
-      return;
-    }
-
-    if (videoBlob.size > 50 * 1024 * 1024) {
-      setTrimError('50MB 이하의 mp4만 구간 내보내기를 지원해요.');
-      return;
-    }
-
-    if (typeof effectiveDurationMs !== 'number') {
-      setTrimError('영상 길이를 확인한 뒤 다시 시도해 주세요.');
-      return;
-    }
-
-    if (effectiveDurationMs > 30_000) {
-      setTrimError('길이 30초 이하의 영상을 사용해 주세요.');
-      return;
-    }
-
-    if (!normalizedTrimRange) {
-      setTrimError('유효한 트림 구간을 선택해 주세요.');
-      return;
-    }
-
-    const { trimStart, trimEnd } = normalizedTrimRange;
-
-    stopTrimWorker();
-    if (trimResultUrl) {
-      URL.revokeObjectURL(trimResultUrl);
-      setTrimResultUrl(null);
-    }
-
-    setTrimError(null);
-    setTrimProgress(0);
-    setTrimMessage('ffmpeg.wasm을 로드하는 중이에요…');
-    setIsTrimming(true);
-
-    const worker = new Worker(new URL('../workers/trimWorker.ts', import.meta.url), {
-      type: 'module',
-    });
-
-    trimWorkerRef.current = worker;
-    const requestId = Date.now();
-    const fileName = `${safeTitleOrId}_trim_${Math.round(trimStart)}-${Math.round(trimEnd)}_${formatNowForFileName()}.mp4`;
-    setTrimFileName(fileName);
-
-    function cleanup() {
-      worker.removeEventListener('message', handleMessage);
-      worker.removeEventListener('error', handleError);
-      stopTrimWorker();
-    }
-
-    function handleError(errorEvent: ErrorEvent) {
-      console.error('[trim-worker] crashed', errorEvent);
-      setTrimError('구간 내보내기 중 오류가 발생했어요. 다시 시도해 주세요.');
-      setIsTrimming(false);
-      cleanup();
-    }
-
-    function handleMessage(event: MessageEvent<TrimWorkerResponse>) {
-      const data = event.data;
-      if (!data || data.requestId !== requestId) return;
-
-      if (data.type === 'progress') {
-        if (typeof data.progress === 'number') setTrimProgress(data.progress);
-        if (data.message) setTrimMessage(data.message);
-        return;
-      }
-
-      if (data.type === 'done') {
-        const blob = new Blob([data.output], { type: 'video/mp4' });
-        const url = URL.createObjectURL(blob);
-        setTrimResultUrl(url);
-        setTrimMessage('트림된 mp4가 준비됐어요.');
-        setIsTrimming(false);
-        cleanup();
-
-        const link = document.createElement('a');
-        link.href = url;
-        link.download = fileName;
-        link.click();
-        return;
-      }
-
-      if (data.type === 'error') {
-        setTrimError('구간 mp4 내보내기에 실패했어요. 잠시 후 다시 시도해 주세요.');
-        console.error('[trim-worker] error', data.message);
-        setIsTrimming(false);
-        cleanup();
-      }
-    }
-
-    worker.addEventListener('message', handleMessage);
-    worker.addEventListener('error', handleError);
-
-    try {
-      const videoBuffer = await videoBlob.arrayBuffer();
-      worker.postMessage(
-        { type: 'trim', requestId, videoData: videoBuffer, startMs: trimStart, endMs: trimEnd },
-        [videoBuffer],
-      );
-    } catch (error) {
-      setTrimError(error instanceof Error ? error.message : '구간 mp4 내보내기에 실패했어요.');
-      setIsTrimming(false);
-      cleanup();
-    }
-  }, [
+  const {
+    handleCancelTrim,
+    handleTrimExport,
+    isTrimming,
+    trimError,
+    trimFileName,
+    trimMessage,
+    trimProgress,
+    trimResultUrl,
+  } = useTrimExport({
     applyTrimOnExport,
     effectiveDurationMs,
     normalizedTrimRange,
     safeTitleOrId,
-    stopTrimWorker,
     trimRange,
-    trimResultUrl,
     videoBlob,
-  ]);
-
-  const handleCancelTrim = useCallback(() => {
-    stopTrimWorker();
-    setIsTrimming(false);
-    setTrimProgress(null);
-    setTrimMessage('구간 mp4 내보내기를 취소했어요.');
-  }, [stopTrimWorker]);
-
-  useEffect(() => {
-    return () => {
-      stopTrimWorker();
-    };
-  }, [stopTrimWorker]);
-
-  useEffect(() => {
-    return () => {
-      if (trimResultUrl) {
-        try {
-          URL.revokeObjectURL(trimResultUrl);
-        } catch {
-          // ignore
-        }
-      }
-    };
-  }, [trimResultUrl]);
+  });
 
   const postWaveformWorkerMessage = useCallback(
     (message: WaveformWorkerPayload, transfer: Transferable[] = []) => {
