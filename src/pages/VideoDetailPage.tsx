@@ -8,6 +8,7 @@ import { queryClient } from '@/lib/queryClient';
 import { normalizeTrimRange } from '@/lib/trimRange';
 import type { WaveformWorkerResponse } from '@/workers/waveformWorker';
 
+import { CaptionEditor } from './videoDetail/captions/CaptionEditor';
 import {
   createCaptionExportJson,
   createCaptionExportSrt,
@@ -38,7 +39,6 @@ import {
   autoAlignCaptions,
   createCaptionId,
   formatDate,
-  formatKeyLabel,
   formatMeta,
   formatMsWithSeconds,
   formatSeconds,
@@ -199,9 +199,6 @@ export default function VideoDetailPage() {
   const waveformFollowResumeTimeoutRef = useRef<number | null>(null);
   const shouldLoopTrimRef = useRef(false);
   const normalizedTrimRangeRef = useRef<ReturnType<typeof normalizeTrimRange>>(null);
-  const captionRefs = useRef<Record<string, HTMLLIElement | null>>({});
-  const pendingCaptionTextFocusIdRef = useRef<string | null>(null);
-  const prevCaptionIdsRef = useRef<string[]>([]);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const [currentTimeMs, setCurrentTimeMs] = useState<number | null>(null);
   const lastUiTimeUpdateAtRef = useRef<number>(0);
@@ -533,8 +530,6 @@ export default function VideoDetailPage() {
       const next = [...aligned, { id: nextCaptionId, startMs, endMs, text: '' }];
       return autoAlignCaptions(next, captionGapMs);
     });
-    setLastFocusedCaptionId(nextCaptionId);
-    pendingCaptionTextFocusIdRef.current = nextCaptionId;
   }, [captionGapMs, getCurrentTimeMs, resetSaveCaptionsError]);
 
   const handleConfirmCaption = useCallback(
@@ -572,22 +567,10 @@ export default function VideoDetailPage() {
 
       if (createdId) {
         setLastFocusedCaptionId(createdId);
-        pendingCaptionTextFocusIdRef.current = createdId;
       }
     },
     [captionGapMs, resetSaveCaptionsError],
   );
-
-  useEffect(() => {
-    const targetId = pendingCaptionTextFocusIdRef.current;
-    if (!targetId) return;
-    const rowEl = captionRefs.current[targetId];
-    if (!rowEl) return;
-    const inputEl = rowEl.querySelector('textarea, input') as HTMLElement | null;
-    if (!inputEl) return;
-    inputEl.focus();
-    pendingCaptionTextFocusIdRef.current = null;
-  }, [captionDrafts]);
 
   const handleSetCaptionTimeFromVideo = useCallback(
     (captionId: string, field: keyof Pick<Caption, 'startMs' | 'endMs'>) => {
@@ -779,46 +762,6 @@ export default function VideoDetailPage() {
     };
   }, [capturingHotkey]);
 
-  useEffect(() => {
-    const prevIds = prevCaptionIdsRef.current;
-    const nextIds = captionDrafts.map((c) => c.id);
-
-    // 다음 렌더부터 비교할 수 있게 먼저 갱신
-    prevCaptionIdsRef.current = nextIds;
-
-    const prevSet = new Set(prevIds);
-    const added = nextIds.filter((id) => !prevSet.has(id));
-
-    // import처럼 여러 개가 한 번에 추가되는 케이스는 건드리지 않음
-    if (added.length !== 1) return;
-
-    const newCaptionId = added[0] ?? null;
-    if (!newCaptionId) return;
-
-    setLastFocusedCaptionId(newCaptionId);
-
-    if (typeof window === 'undefined') return;
-
-    let tries = 0;
-    const tryFocus = () => {
-      tries += 1;
-      const root = captionRefs.current[newCaptionId];
-      const el = root?.querySelector(
-        // 우선 textarea(자막 내용), 없으면 text input(혹시 구조가 다를 때)
-        'textarea, input[type="text"], input:not([type])',
-      ) as HTMLTextAreaElement | HTMLInputElement | null;
-
-      if (el) {
-        el.focus();
-        if ('select' in el) el.select?.();
-        return;
-      }
-
-      if (tries < 8) window.setTimeout(tryFocus, 25);
-    };
-
-    window.setTimeout(tryFocus, 0);
-  }, [captionDrafts]);
 
   const handleDeleteCaption = useCallback((captionId: string) => {
     resetSaveCaptionsError();
@@ -2147,21 +2090,6 @@ export default function VideoDetailPage() {
     }
   }, [shouldUseLiveWaveform, stopWaveform]);
 
-  useEffect(() => {
-    const liveIds = new Set(captionDrafts.map((c) => c.id));
-    for (const key of Object.keys(captionRefs.current)) {
-      if (!liveIds.has(key)) delete captionRefs.current[key];
-    }
-  }, [captionDrafts]);
-
-  useEffect(() => {
-    if (!activeCaptionId) return;
-    const target = captionRefs.current[activeCaptionId];
-    if (!target) return;
-
-    target.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
-  }, [activeCaptionId]);
-
   const selection = useMemo(() => {
     if (!trimRange || typeof effectiveDurationMs !== 'number') return null;
     const startMs = Math.max(0, Math.min(trimRange.startMs, effectiveDurationMs));
@@ -2451,724 +2379,62 @@ export default function VideoDetailPage() {
               </div>
             </section>
 
-          <section
-            className="video-detail-captions"
-            style={{
-              padding: 16,
-              borderRadius: 10,
-              border: '1px solid #e6e6e6',
-              background: '#fff',
-              // 자막 리스트가 길어지면 섹션 내부에서 스크롤되도록
-              display: 'flex',
-              flexDirection: 'column',
-              minHeight: 0,
-              maxHeight: '100vh',
-              gap: 12,
+          <CaptionEditor
+            video={video}
+            isMetadataReady={isMetadataReady}
+            captionDrafts={captionDrafts}
+            activeCaptionId={activeCaptionId}
+            captionGapMs={captionGapMs}
+            onCaptionGapChange={setCaptionGapMs}
+            isCaptionsLoading={isCaptionsLoading}
+            isCaptionsError={isCaptionsError}
+            captionsError={captionsError}
+            importError={importError}
+            hotkeyItems={hotkeyItems}
+            hotkeyConfig={hotkeyConfig}
+            capturingHotkey={capturingHotkey}
+            onResetHotkeys={() => {
+              setCapturingHotkey(null);
+              setHotkeyConfig({ ...DEFAULT_HOTKEYS });
             }}
-          >
-            <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
-              <h3 style={{ margin: 0 }}>자막</h3>
-              <button
-                type="button"
-                onClick={handleAddCaption}
-                style={{
-                  padding: '6px 10px',
-                  borderRadius: 6,
-                  border: '1px solid #111',
-                  cursor: 'pointer',
-                  background: '#111',
-                  color: '#fff',
-                }}
-                disabled={isCaptionsLoading || isSavingCaptions}
-              >
-                새 자막 추가
-              </button>
-              <div style={{ flex: 1 }} />
-              {lastSavedAt ? (
-                <span style={{ color: '#666', fontSize: 12 }}>
-                  마지막 저장: {new Date(lastSavedAt).toLocaleTimeString()}
-                </span>
-              ) : null}
-            </div>
-
-            <div
-              style={{
-                display: 'grid',
-                gap: 10,
-                padding: 12,
-                borderRadius: 10,
-                border: '1px solid #e6e6e6',
-                background: '#f8fafc',
-              }}
-            >
-              <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
-                <strong style={{ fontSize: 14, color: '#111' }}>단축키 설정</strong>
-                <span style={{ fontSize: 12, color: '#555' }}>
-                  입력창 포커스 상태에서도 동작하며, IME 조합 중에는 동작하지 않아요.
-                </span>
-                <div style={{ flex: 1 }} />
-                <button
-                  type="button"
-                  onClick={() => {
-                    setCapturingHotkey(null);
-                    setHotkeyConfig({ ...DEFAULT_HOTKEYS });
-                  }}
-                  style={{
-                    padding: '6px 10px',
-                    borderRadius: 6,
-                    border: '1px solid #cbd5e1',
-                    background: '#fff',
-                    color: '#111',
-                    cursor: 'pointer',
-                  }}
-                >
-                  기본값 복원
-                </button>
-              </div>
-              <div
-                style={{
-                  display: 'grid',
-                  gap: 8,
-                  gridTemplateColumns: 'repeat(auto-fit, minmax(240px, 1fr))',
-                }}
-              >
-                {hotkeyItems.map((item) => {
-                  const isCapturing = capturingHotkey === item.key;
-                  return (
-                    <div
-                      key={item.key}
-                      style={{
-                        display: 'flex',
-                        alignItems: 'center',
-                        justifyContent: 'space-between',
-                        gap: 12,
-                        padding: '8px 10px',
-                        borderRadius: 8,
-                        border: '1px solid #e2e8f0',
-                        background: '#fff',
-                      }}
-                    >
-                      <div style={{ display: 'grid', gap: 2, minWidth: 0 }}>
-                        <span style={{ fontSize: 13, color: '#111', fontWeight: 600 }}>{item.label}</span>
-                        <span style={{ fontSize: 12, color: '#555', wordBreak: 'keep-all' }}>
-                          {item.description}
-                        </span>
-                      </div>
-                      <button
-                        type="button"
-                        onClick={() => setCapturingHotkey(item.key)}
-                        style={{
-                          padding: '6px 10px',
-                          borderRadius: 6,
-                          border: isCapturing ? '1px solid #111' : '1px solid #cbd5e1',
-                          background: isCapturing ? '#111' : '#f8fafc',
-                          color: isCapturing ? '#fff' : '#111',
-                          cursor: 'pointer',
-                          minWidth: 120,
-                        }}
-                      >
-                        {isCapturing ? '입력 대기… (Esc)' : formatKeyLabel(hotkeyConfig[item.key])}
-                      </button>
-                    </div>
-                  );
-                })}
-              </div>
-              <div
-                style={{
-                  display: 'flex',
-                  alignItems: 'center',
-                  gap: 12,
-                  flexWrap: 'wrap',
-                }}
-              >
-                <strong style={{ fontSize: 14, color: '#111' }}>자동 시간 간격</strong>
-                <span style={{ fontSize: 12, color: '#555' }}>
-                  Enter로 자막을 확정하면 다음 자막의 시작 시간을 이전 종료 시간 뒤로 맞춰줘요.
-                </span>
-                <div style={{ flex: 1 }} />
-                <label
-                  style={{
-                    display: 'inline-flex',
-                    alignItems: 'center',
-                    gap: 8,
-                    fontSize: 13,
-                    color: '#111',
-                  }}
-                >
-                  간격(ms)
-                  <input
-                    type="number"
-                    min={0}
-                    value={captionGapMs}
-                    onChange={(e) => setCaptionGapMs(parseCaptionGapMs(e.target.value))}
-                    style={{
-                      padding: '6px 8px',
-                      borderRadius: 6,
-                      border: '1px solid #cbd5e1',
-                      width: 100,
-                    }}
-                  />
-                </label>
-              </div>
-            </div>
-
-            {isCaptionsLoading ? (
-              <p style={{ margin: 0 }}>자막을 불러오는 중이에요…</p>
-            ) : isCaptionsError ? (
-              <div
-                style={{
-                  padding: 12,
-                  borderRadius: 8,
-                  border: '1px solid #f2c4c4',
-                  background: '#fff6f6',
-                  color: '#b00020',
-                }}
-              >
-                <p style={{ margin: '0 0 6px' }}>자막을 불러오지 못했어요.</p>
-                <pre
-                  style={{
-                    margin: 0,
-                    padding: 8,
-                    borderRadius: 6,
-                    background: '#2f1317',
-                    color: '#ffeaea',
-                    whiteSpace: 'pre-wrap',
-                    wordBreak: 'break-all',
-                    fontSize: 12,
-                  }}
-                >
-                  {captionsError instanceof Error ? captionsError.message : String(captionsError)}
-                </pre>
-              </div>
-            ) : captionDrafts.length === 0 ? (
-              <p style={{ margin: 0, color: '#555' }}>
-                자막이 없어요. 새 자막을 추가해보세요.
-              </p>
-            ) : (
-              <div
-                style={{
-                  flex: 1,
-                  minHeight: 0,
-                  overflowY: 'auto',
-                  paddingRight: 6,
-                }}
-              >
-                <ul style={{ listStyle: 'none', padding: 0, margin: 0, display: 'grid', gap: 12 }}>
-                  {captionDrafts.map((caption) => {
-                  const errors = getCaptionErrors(caption);
-                  const hasError = Object.keys(errors).length > 0;
-                  const isActive = activeCaptionId === caption.id;
-                  return (
-                    <li
-                      key={caption.id}
-                      ref={(node) => {
-                        captionRefs.current[caption.id] = node;
-                      }}
-                      style={{
-                        border: isActive ? '1px solid #111' : '1px solid #e6e6e6',
-                        borderRadius: 10,
-                        padding: 12,
-                        background: hasError
-                          ? '#fffafa'
-                          : isActive
-                            ? '#f5f8ff'
-                            : '#fdfdfd',
-                        display: 'grid',
-                        boxShadow: isActive ? '0 0 0 2px #dfe8ff' : undefined,
-                        gap: 8,
-                      }}
-                    >
-                      <div
-                        style={{
-                          display: 'grid',
-                          gridTemplateColumns: 'repeat(auto-fit, minmax(160px, 1fr))',
-                          gap: 8,
-                          alignItems: 'center',
-                        }}
-                      >
-                        <label style={{ display: 'grid', gap: 4 }}>
-                          <span style={{ fontSize: 12, color: '#555' }}>시작(ms)</span>
-                          <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
-                            <input
-                              type="number"
-                              min={0}
-                              value={Number.isFinite(caption.startMs) ? caption.startMs : ''}
-                              onChange={(e) =>
-                                handleCaptionFieldChange(caption.id, 'startMs', e.target.value)
-                              }
-                              onFocus={() => setLastFocusedCaptionId(caption.id)}
-                              style={{
-                                padding: '8px 10px',
-                                borderRadius: 6,
-                                border: '1px solid #ccc',
-                              }}
-                            />
-                            <button
-                              type="button"
-                              onClick={() => handleSetCaptionTimeFromVideo(caption.id, 'startMs')}
-                              style={{
-                                padding: '6px 10px',
-                                borderRadius: 6,
-                                border: '1px solid #ccc',
-                                cursor: 'pointer',
-                                background: '#f7f7f7',
-                                color: '#111',
-                                whiteSpace: 'nowrap',
-                              }}
-                            >
-                              현재 재생 위치로 설정
-                            </button>
-                          </div>
-                          {errors.startMs ? (
-                            <span style={{ color: '#b00020', fontSize: 12 }}>{errors.startMs}</span>
-                          ) : null}
-                        </label>
-                        <label style={{ display: 'grid', gap: 4 }}>
-                          <span style={{ fontSize: 12, color: '#555' }}>종료(ms)</span>
-                          <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
-                            <input
-                              type="number"
-                              min={0}
-                              value={Number.isFinite(caption.endMs) ? caption.endMs : ''}
-                              onChange={(e) => handleCaptionFieldChange(caption.id, 'endMs', e.target.value)}
-                              onFocus={() => setLastFocusedCaptionId(caption.id)}
-                              style={{
-                                padding: '8px 10px',
-                                borderRadius: 6,
-                                border: '1px solid #ccc',
-                              }}
-                            />
-                            <button
-                              type="button"
-                              onClick={() => handleSetCaptionTimeFromVideo(caption.id, 'endMs')}
-                              style={{
-                                padding: '6px 10px',
-                                borderRadius: 6,
-                                border: '1px solid #ccc',
-                                cursor: 'pointer',
-                                background: '#f7f7f7',
-                                color: '#111',
-                                whiteSpace: 'nowrap',
-                              }}
-                            >
-                              현재 재생 위치로 설정
-                            </button>
-                          </div>
-                          {errors.endMs ? (
-                            <span style={{ color: '#b00020', fontSize: 12 }}>{errors.endMs}</span>
-                          ) : null}
-                        </label>
-                        <label style={{ display: 'grid', gap: 4 }}>
-                          <span style={{ fontSize: 12, color: '#555' }}>자막 내용</span>
-                          <textarea
-                            value={caption.text}
-                            onChange={(e) => handleCaptionFieldChange(caption.id, 'text', e.target.value)}
-                            onFocus={() => setLastFocusedCaptionId(caption.id)}
-                            onKeyDown={(e) => {
-                              if (e.nativeEvent.isComposing) return;
-                              if (e.key === 'Enter' && !e.shiftKey) {
-                                e.preventDefault();
-                                handleConfirmCaption(caption.id);
-                              }
-                            }}
-                            placeholder="자막을 입력하세요"
-                            rows={3}
-                            style={{
-                              padding: '8px 10px',
-                              borderRadius: 6,
-                              border: '1px solid #ccc',
-                              resize: 'vertical',
-                            }}
-                          />
-                          {errors.text ? (
-                            <span style={{ color: '#b00020', fontSize: 12 }}>{errors.text}</span>
-                          ) : null}
-                        </label>
-                        <div style={{ display: 'flex', justifyContent: 'flex-end' }}>
-                          <button
-                            type="button"
-                            onClick={() => handleDeleteCaption(caption.id)}
-                            style={{
-                              padding: '8px 12px',
-                              borderRadius: 8,
-                              border: '1px solid #b00020',
-                              background: '#fff6f6',
-                              color: '#b00020',
-                              cursor: 'pointer',
-                              height: 'fit-content',
-                            }}
-                            aria-label="자막 삭제"
-                          >
-                            삭제
-                          </button>
-                        </div>
-                      </div>
-                    </li>
-                  );
-                })}
-                </ul>
-              </div>
-            )}
-
-            {isSaveCaptionsError ? (
-              <div
-                style={{
-                  padding: 12,
-                  borderRadius: 8,
-                  border: '1px solid #f2c4c4',
-                  background: '#fff6f6',
-                  color: '#b00020',
-                }}
-              >
-                <p style={{ margin: '0 0 6px' }}>자막 저장에 실패했어요.</p>
-                <pre
-                  style={{
-                    margin: 0,
-                    padding: 8,
-                    borderRadius: 6,
-                    background: '#2f1317',
-                    color: '#ffeaea',
-                    whiteSpace: 'pre-wrap',
-                    wordBreak: 'break-all',
-                    fontSize: 12,
-                  }}
-                >
-                  {saveCaptionsError instanceof Error ? saveCaptionsError.message : String(saveCaptionsError)}
-                </pre>
-              </div>
-            ) : null}
-
-            <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
-              <button
-                type="button"
-                onClick={handleSaveCaptions}
-                disabled={
-                  isCaptionsLoading ||
-                  isSavingCaptions ||
-                  hasCaptionErrors ||
-                  captionDrafts.length === 0
-                }
-                style={{
-                  padding: '10px 14px',
-                  borderRadius: 8,
-                  border: 'none',
-                  background: '#111',
-                  color: '#fff',
-                  cursor: 'pointer',
-                }}
-              >
-                {isSavingCaptions ? '저장 중…' : '자막 저장'}
-              </button>
-              {hasCaptionErrors ? (
-                <span style={{ color: '#b00020', fontSize: 13 }}>
-                  모든 자막의 시작·종료 시간과 내용을 확인하세요.
-                </span>
-              ) : (
-                <span style={{ color: '#555', fontSize: 13 }}>
-                  시작 시간 오름차순으로 정렬되어 저장돼요.
-                </span>
-              )}
-            </div>
-            <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', marginTop: 8 }}>
-              <input
-                ref={fileInputRef}
-                type="file"
-                accept="application/json"
-                style={{ display: 'none' }}
-                onChange={handleImportJsonFile}
-              />
-              <label style={{ display: 'inline-flex', alignItems: 'center', gap: 6, marginRight: 12 }}>
-                <input
-                  type="checkbox"
-                  checked={applyTrimOnExport}
-                  disabled={!trimRange}
-                  onChange={(event) => setApplyTrimOnExport(event.target.checked)}
-                />
-                <span style={{ fontSize: 14, color: '#111' }}>
-                  선택 구간만 내보내기
-                  <span style={{ color: '#666', marginLeft: 6, fontSize: 12 }}>(시작 시간을 0으로 맞춰 저장)</span>
-                  {!trimRange ? (
-                    <span style={{ color: '#666', marginLeft: 6, fontSize: 12 }}>(트림 구간을 먼저 선택)</span>
-                  ) : null}
-                </span>
-              </label>
-              <button
-                type="button"
-                onClick={handleImportJsonClick}
-                style={{
-                  padding: '9px 12px',
-                  borderRadius: 8,
-                  border: '1px solid #ccc',
-                  background: '#f8f8f8',
-                  color: '#111',
-                  cursor: 'pointer',
-                }}
-              >
-                JSON 불러오기
-              </button>
-              <button
-                type="button"
-                onClick={handleExportJson}
-                style={{
-                  padding: '9px 12px',
-                  borderRadius: 8,
-                  border: '1px solid #ccc',
-                  background: '#f8f8f8',
-                  color: '#111',
-                  cursor: 'pointer',
-                }}
-              >
-                JSON 내보내기
-              </button>
-              <button
-                type="button"
-                onClick={handleExportSrt}
-                style={{
-                  padding: '9px 12px',
-                  borderRadius: 8,
-                  border: '1px solid #ccc',
-                  background: '#f8f8f8',
-                  color: '#111',
-                  cursor: 'pointer',
-                }}
-              >
-                SRT 내보내기
-              </button>
-            </div>
-
-            {applyTrimOnExport ? (
-              <div
-                style={{
-                  marginTop: 12,
-                  padding: 12,
-                  border: '1px solid #e6e6e6',
-                  borderRadius: 10,
-                  background: '#fafafa',
-                  display: 'flex',
-                  flexDirection: 'column',
-                  gap: 8,
-                }}
-              >
-                <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center' }}>
-                  <button
-                    type="button"
-                    onClick={handleTrimExport}
-                    disabled={
-                      isTrimming ||
-                      isBlobLoading ||
-                      Boolean(videoBlobError) ||
-                      !videoBlob ||
-                      !normalizedTrimRange
-                    }
-                    style={{
-                      padding: '10px 14px',
-                      borderRadius: 8,
-                      border: '1px solid #222',
-                      background: '#111',
-                      color: '#fff',
-                      cursor: isTrimming ? 'not-allowed' : 'pointer',
-                    }}
-                  >
-                    {isTrimming ? '구간 내보내는 중…' : '구간 mp4 내보내기'}
-                  </button>
-                  {isTrimming ? (
-                    <button
-                      type="button"
-                      onClick={handleCancelTrim}
-                      style={{
-                        padding: '9px 12px',
-                        borderRadius: 8,
-                        border: '1px solid #b00020',
-                        background: '#fff6f6',
-                        color: '#b00020',
-                        cursor: 'pointer',
-                      }}
-                    >
-                      작업 취소
-                    </button>
-                  ) : null}
-                </div>
-                <p style={{ margin: 0, color: '#555', fontSize: 13 }}>
-                  선택한 구간만 mp4로 잘라내요. 지원: mp4 · 길이 30초 이하 또는 50MB 이하.{' '}
-                  {trimRangeSummary
-                    ? `선택 범위 ${trimRangeSummary.durationSeconds}s (${formatMsWithSeconds(trimRangeSummary.startMs)} ~ ${formatMsWithSeconds(trimRangeSummary.endMs)}).`
-                    : '유효한 트림 구간을 선택해 주세요.'}
-                </p>
-                {trimProgress !== null || trimMessage ? (
-                  <div style={{ color: '#111', fontSize: 14, lineHeight: 1.4 }}>
-                    {trimProgress !== null ? (
-                      <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
-                        <div
-                          style={{
-                            flex: '0 0 160px',
-                            height: 8,
-                            borderRadius: 999,
-                            background: '#e5e5e5',
-                            overflow: 'hidden',
-                          }}
-                        >
-                          <div
-                            style={{
-                              width: `${Math.round(Math.min(1, Math.max(0, trimProgress)) * 100)}%`,
-                              height: '100%',
-                              background: '#4a90e2',
-                            }}
-                          />
-                        </div>
-                        <span style={{ color: '#333', fontSize: 13 }}>
-                          {Math.round(Math.min(1, Math.max(0, trimProgress)) * 100)}%
-                        </span>
-                      </div>
-                    ) : null}
-                    {trimMessage ? <div style={{ marginTop: 4, color: '#333' }}>{trimMessage}</div> : null}
-                  </div>
-                ) : null}
-                {trimResultUrl && trimFileName ? (
-                  <div style={{ fontSize: 14 }}>
-                    <a
-                      href={trimResultUrl}
-                      download={trimFileName}
-                      style={{ color: '#0b74de', textDecoration: 'underline' }}
-                    >
-                      트림된 mp4 다시 저장하기
-                    </a>
-                  </div>
-                ) : null}
-                {trimError ? (
-                  <div
-                    style={{
-                      padding: 10,
-                      borderRadius: 8,
-                      border: '1px solid #f2c4c4',
-                      background: '#fff6f6',
-                      color: '#b00020',
-                      fontSize: 14,
-                    }}
-                  >
-                    <p style={{ margin: '0 0 4px' }}>{trimError}</p>
-                    <p style={{ margin: 0, color: '#b00020', fontSize: 12 }}>DEV 로그는 콘솔을 확인하세요.</p>
-                  </div>
-                ) : null}
-              </div>
-            ) : null}
-
-            <div
-              style={{
-                marginTop: 12,
-                padding: 12,
-                border: '1px solid #e6e6e6',
-                borderRadius: 10,
-                background: '#fafafa',
-                display: 'flex',
-                flexDirection: 'column',
-                gap: 8,
-              }}
-            >
-              <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center' }}>
-                <button
-                  type="button"
-                  onClick={handleBurnInExport}
-                  disabled={
-                    isBurningIn ||
-                    isBlobLoading ||
-                    Boolean(videoBlobError) ||
-                    !videoBlob ||
-                    captionDrafts.length === 0
-                  }
-                  style={{
-                    padding: '10px 14px',
-                    borderRadius: 8,
-                    border: '1px solid #222',
-                    background: '#111',
-                    color: '#fff',
-                    cursor: isBurningIn ? 'not-allowed' : 'pointer',
-                  }}
-                >
-                  {isBurningIn ? '번인 내보내는 중…' : '자막 번인 mp4 내보내기'}
-                </button>
-                {isBurningIn ? (
-                  <button
-                    type="button"
-                    onClick={handleCancelBurnIn}
-                    style={{
-                      padding: '9px 12px',
-                      borderRadius: 8,
-                      border: '1px solid #b00020',
-                      background: '#fff6f6',
-                      color: '#b00020',
-                      cursor: 'pointer',
-                    }}
-                  >
-                    작업 취소
-                  </button>
-                ) : null}
-              </div>
-              <p style={{ margin: 0, color: '#555', fontSize: 13 }}>
-                지원: mp4 · 길이 30초 이하 또는 50MB 이하. 진행 중에도 다른 작업은 그대로 사용할 수 있어요.
-              </p>
-              {burnInProgress !== null || burnInMessage ? (
-                <div style={{ color: '#111', fontSize: 14, lineHeight: 1.4 }}>
-                  {burnInProgress !== null ? (
-                    <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
-                      <div
-                        style={{
-                          flex: '0 0 160px',
-                          height: 8,
-                          borderRadius: 999,
-                          background: '#e5e5e5',
-                          overflow: 'hidden',
-                        }}
-                      >
-                        <div
-                          style={{
-                            width: `${Math.round(Math.min(1, Math.max(0, burnInProgress)) * 100)}%`,
-                            height: '100%',
-                            background: '#4a90e2',
-                          }}
-                        />
-                      </div>
-                      <span style={{ color: '#333', fontSize: 13 }}>
-                        {Math.round(Math.min(1, Math.max(0, burnInProgress)) * 100)}%
-                      </span>
-                    </div>
-                  ) : null}
-                  {burnInMessage ? <div style={{ marginTop: 4, color: '#333' }}>{burnInMessage}</div> : null}
-                </div>
-              ) : null}
-              {burnInResultUrl && burnInFileName ? (
-                <div style={{ fontSize: 14 }}>
-                  <a
-                    href={burnInResultUrl}
-                    download={burnInFileName}
-                    style={{ color: '#0b74de', textDecoration: 'underline' }}
-                  >
-                    번인된 mp4 다시 저장하기
-                  </a>
-                </div>
-              ) : null}
-              {burnInError ? (
-                <div
-                  style={{
-                    padding: 10,
-                    borderRadius: 8,
-                    border: '1px solid #f2c4c4',
-                    background: '#fff6f6',
-                    color: '#b00020',
-                    fontSize: 14,
-                  }}
-                >
-                  <p style={{ margin: '0 0 4px' }}>{burnInError}</p>
-                  <p style={{ margin: 0, color: '#b00020', fontSize: 12 }}>
-                    DEV 로그는 콘솔을 확인하세요.
-                  </p>
-                </div>
-              ) : null}
-            </div>
-
-            {importError ? (
-              <p style={{ margin: '8px 0 0', color: '#b00020' }}>{importError}</p>
-            ) : null}
-          </section>
+            onStartCaptureHotkey={setCapturingHotkey}
+            onAddCaption={handleAddCaption}
+            onCaptionFieldChange={handleCaptionFieldChange}
+            onSetCaptionTimeFromVideo={handleSetCaptionTimeFromVideo}
+            onConfirmCaption={handleConfirmCaption}
+            onDeleteCaption={handleDeleteCaption}
+            onCaptionFocus={setLastFocusedCaptionId}
+            onSaveCaptions={handleSaveCaptions}
+            isSavingCaptions={isSavingCaptions}
+            isSaveCaptionsError={isSaveCaptionsError}
+            saveCaptionsError={saveCaptionsError}
+            hasCaptionErrors={hasCaptionErrors}
+            lastSavedAt={lastSavedAt}
+            applyTrimOnExport={applyTrimOnExport}
+            onApplyTrimChange={setApplyTrimOnExport}
+            trimRange={trimRange}
+            fileInputRef={fileInputRef}
+            onImportJsonFile={handleImportJsonFile}
+            onImportJsonClick={handleImportJsonClick}
+            onExportJson={handleExportJson}
+            onExportSrt={handleExportSrt}
+            onHandleTrimExport={handleTrimExport}
+            onHandleCancelTrim={handleCancelTrim}
+            isTrimming={isTrimming}
+            trimProgress={trimProgress}
+            trimMessage={trimMessage}
+            trimResultUrl={trimResultUrl}
+            trimFileName={trimFileName}
+            trimError={trimError}
+            onHandleBurnInExport={handleBurnInExport}
+            onHandleCancelBurnIn={handleCancelBurnIn}
+            isBurningIn={isBurningIn}
+            burnInProgress={burnInProgress}
+            burnInMessage={burnInMessage}
+            burnInResultUrl={burnInResultUrl}
+            burnInFileName={burnInFileName}
+            burnInError={burnInError}
+          />
 
           <section
             className="video-detail-thumbnail"
